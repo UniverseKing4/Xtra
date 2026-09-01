@@ -248,7 +248,7 @@ class DownloadsFragment : PagedListFragment(), Scrollable {
                 val delete = getString(R.string.delete)
                 val checkBox = CheckBox(requireContext()).apply {
                     text = getString(R.string.keep_files)
-                    isChecked = true
+                    isChecked = false
                 }
                 val checkBoxView = LinearLayout(requireContext()).apply {
                     addView(checkBox)
