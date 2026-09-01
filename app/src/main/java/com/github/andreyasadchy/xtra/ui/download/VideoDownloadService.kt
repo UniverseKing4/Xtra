@@ -432,9 +432,7 @@ class VideoDownloadService : LifecycleService() {
         val mutexMap = mutableMapOf<Int, Mutex>()
         val count = MutableStateFlow(0)
         downloadProgress.lastSaved = System.currentTimeMillis()
-        val chatJob = launch(Dispatchers.IO) {
-            startChatJob(offlineVideo, downloadProgress, path)
-        }
+        startChatJob(offlineVideo, downloadProgress, path)
         val jobs = segments.drop(downloadProgress.progress).mapIndexed { index, segment ->
             requestSemaphore.acquire()
             launch(Dispatchers.IO) {
@@ -555,7 +553,6 @@ class VideoDownloadService : LifecycleService() {
             }
         }
         jobs.joinAll()
-        chatJob.join()
     }
 
     private suspend fun downloadPlaylist(offlineVideo: OfflineVideo, downloadProgress: DownloadProgress, networkLibrary: String?, urlPath: String, path: String, playlist: MediaPlaylist, segments: List<Segment>) = withContext(Dispatchers.IO) {
@@ -726,9 +723,7 @@ class VideoDownloadService : LifecycleService() {
         val mutexMap = mutableMapOf<Int, Mutex>()
         val count = MutableStateFlow(0)
         downloadProgress.lastSaved = System.currentTimeMillis()
-        val chatJob = launch(Dispatchers.IO) {
-            startChatJob(offlineVideo, downloadProgress, path)
-        }
+        startChatJob(offlineVideo, downloadProgress, path)
         val jobs = segments.drop(downloadProgress.progress).mapIndexed { index, segment ->
             requestSemaphore.acquire()
             launch(Dispatchers.IO) {
@@ -858,7 +853,6 @@ class VideoDownloadService : LifecycleService() {
             }
         }
         jobs.joinAll()
-        chatJob.join()
     }
 
     private suspend fun downloadClip(offlineVideo: OfflineVideo, downloadProgress: DownloadProgress, sourceUrl: String) = withContext(Dispatchers.IO) {
@@ -892,9 +886,7 @@ class VideoDownloadService : LifecycleService() {
             fileUri
         }
         downloadProgress.lastSaved = System.currentTimeMillis()
-        val chatJob = launch(Dispatchers.IO) {
-            startChatJob(offlineVideo, downloadProgress, path)
-        }
+        startChatJob(offlineVideo, downloadProgress, path)
         val job = launch(Dispatchers.IO) {
             if (downloadProgress.progress < downloadProgress.maxProgress) {
                 when {
@@ -964,7 +956,6 @@ class VideoDownloadService : LifecycleService() {
             }
         }
         job.join()
-        chatJob.join()
     }
 
     private suspend fun startChatJob(offlineVideo: OfflineVideo, downloadProgress: DownloadProgress, path: String) = withContext(Dispatchers.IO) {
