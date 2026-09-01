@@ -15,6 +15,22 @@
         app:iconSpaceReserved="false"
         app:singleLineTitle="false" />
 
+    <SwitchPreferenceCompat
+        android:defaultValue="true"
+        android:key="download_auto_retry"
+        android:title="@string/download_auto_retry"
+        app:iconSpaceReserved="false"
+        app:singleLineTitle="false" />
+
+    <EditTextPreference
+        android:defaultValue="3"
+        android:key="download_auto_retry_count"
+        android:title="@string/download_auto_retry_count"
+        app:dialogMessage="@string/download_auto_retry_count_summary"
+        app:iconSpaceReserved="false"
+        app:singleLineTitle="false"
+        app:useSimpleSummaryProvider="true" />
+
     <SeekBarPreference
         android:defaultValue="2"
         android:key="download_limit"

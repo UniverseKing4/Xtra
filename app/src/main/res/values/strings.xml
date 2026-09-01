@@ -387,6 +387,9 @@
     <string name="download_blocked">Waiting for Internet connection</string>
     <string name="download_blocked_wifi">Waiting for Wi-Fi connection</string>
     <string name="download_wifi_only">Download using Wi-Fi only</string>
+    <string name="download_auto_retry">Auto retry failed downloads</string>
+    <string name="download_auto_retry_count">Auto retry count</string>
+    <string name="download_auto_retry_count_summary">Number of times to automatically retry downloading when it fails</string>
     <string name="download_waiting_for_stream">Waiting for stream</string>
     <string name="download_live_check">Stream playlist check frequency</string>
     <string name="download_live_check_summary">Seconds to wait between checks to see if the playlist has new segments</string>

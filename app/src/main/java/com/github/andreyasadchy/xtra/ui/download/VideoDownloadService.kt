@@ -43,6 +43,7 @@ import com.github.andreyasadchy.xtra.util.m3u8.Segment
 import com.github.andreyasadchy.xtra.util.prefs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
@@ -132,17 +133,29 @@ class VideoDownloadService : LifecycleService() {
                             )
                         }
                         sendNotification(offlineVideo, downloadProgress)
-                        try {
-                            val sourceUrl = offlineVideo.sourceUrl!!
-                            if (sourceUrl.endsWith(".m3u8")) {
-                                downloadVideo(offlineVideo, downloadProgress, sourceUrl)
-                            } else {
-                                downloadClip(offlineVideo, downloadProgress, sourceUrl)
+                        var retriesLeft = prefs().getString(C.DOWNLOAD_AUTO_RETRY_COUNT, "3")?.toIntOrNull() ?: 3
+                        val autoRetry = prefs().getBoolean(C.DOWNLOAD_AUTO_RETRY, true)
+                        while (true) {
+                            try {
+                                val sourceUrl = offlineVideo.sourceUrl!!
+                                if (sourceUrl.endsWith(".m3u8")) {
+                                    downloadVideo(offlineVideo, downloadProgress, sourceUrl)
+                                } else {
+                                    downloadClip(offlineVideo, downloadProgress, sourceUrl)
+                                }
+                                break
+                            } catch (e: CancellationException) {
+                                ensureActive()
+                                break
+                            } catch (e: Exception) {
+                                Log.e("VideoDownloadService", "Download failed", e)
+                                if (autoRetry && retriesLeft > 0) {
+                                    retriesLeft--
+                                    delay(5000L)
+                                } else {
+                                    break
+                                }
                             }
-                        } catch (e: CancellationException) {
-                            ensureActive()
-                        } catch (e: Exception) {
-                            Log.e("VideoDownloadService", "Download failed", e)
                         }
                         offlineVideos.remove(offlineVideo)
                         activeDownloads.remove(downloadProgress)

@@ -144,16 +144,27 @@ class StreamDownloadService : LifecycleService() {
                         )
                     }
                     sendNotification(offlineVideo, downloadProgress)
-                    val done = try {
-                        val channelLogin = offlineVideo.channelLogin!!
-                        downloadStream(offlineVideo, downloadProgress, downloadJob, channelLogin)
-                        true
-                    } catch (e: CancellationException) {
-                        ensureActive()
-                        false
-                    } catch (e: Exception) {
-                        Log.e("StreamDownloadService", "Download failed", e)
-                        false
+                    var retriesLeft = prefs().getString(C.DOWNLOAD_AUTO_RETRY_COUNT, "3")?.toIntOrNull() ?: 3
+                    val autoRetry = prefs().getBoolean(C.DOWNLOAD_AUTO_RETRY, true)
+                    var done = false
+                    while (true) {
+                        try {
+                            val channelLogin = offlineVideo.channelLogin!!
+                            downloadStream(offlineVideo, downloadProgress, downloadJob, channelLogin)
+                            done = true
+                            break
+                        } catch (e: CancellationException) {
+                            ensureActive()
+                            break
+                        } catch (e: Exception) {
+                            Log.e("StreamDownloadService", "Download failed", e)
+                            if (autoRetry && retriesLeft > 0) {
+                                retriesLeft--
+                                delay(5000L)
+                            } else {
+                                break
+                            }
+                        }
                     }
                     offlineVideos.remove(offlineVideo)
                     activeDownloads.remove(downloadProgress)
