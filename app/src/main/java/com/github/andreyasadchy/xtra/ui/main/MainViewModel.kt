@@ -617,7 +617,7 @@ class MainViewModel(
         }
     }
 
-    fun downloadVideo(networkLibrary: String?, filesDir: String, id: String?, title: String?, createdAt: String?, type: String?, channelId: String?, channelLogin: String?, channelName: String?, channelImage: String?, thumbnail: String?, gameId: String?, gameSlug: String?, gameName: String?, url: String, downloadPath: String, quality: String, from: Long, to: Long, downloadChat: Boolean, downloadChatEmotes: Boolean, playlistToFile: Boolean, wifiOnly: Boolean) {
+    fun downloadVideo(networkLibrary: String?, filesDir: String, id: String?, title: String?, createdAt: String?, type: String?, channelId: String?, channelLogin: String?, channelName: String?, channelImage: String?, thumbnail: String?, gameId: String?, gameSlug: String?, gameName: String?, url: String?, downloadPath: String, quality: String, from: Long, to: Long, downloadChat: Boolean, downloadChatEmotes: Boolean, playlistToFile: Boolean, wifiOnly: Boolean) {
         viewModelScope.launch {
             val downloadedThumbnail = id.takeIf { !it.isNullOrBlank() }?.let { id ->
                 thumbnail.takeIf { !it.isNullOrBlank() }?.let { url ->

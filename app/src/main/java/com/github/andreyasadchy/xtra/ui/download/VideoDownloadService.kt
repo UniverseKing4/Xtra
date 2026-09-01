@@ -137,11 +137,15 @@ class VideoDownloadService : LifecycleService() {
                         val autoRetry = prefs().getBoolean(C.DOWNLOAD_AUTO_RETRY, true)
                         while (true) {
                             try {
-                                val sourceUrl = offlineVideo.sourceUrl!!
-                                if (sourceUrl.endsWith(".m3u8")) {
-                                    downloadVideo(offlineVideo, downloadProgress, sourceUrl)
+                                if (offlineVideo.quality == "chat_only") {
+                                    startChatJob(offlineVideo, downloadProgress, offlineVideo.downloadPath!!)
                                 } else {
-                                    downloadClip(offlineVideo, downloadProgress, sourceUrl)
+                                    val sourceUrl = offlineVideo.sourceUrl!!
+                                    if (sourceUrl.endsWith(".m3u8")) {
+                                        downloadVideo(offlineVideo, downloadProgress, sourceUrl)
+                                    } else {
+                                        downloadClip(offlineVideo, downloadProgress, sourceUrl)
+                                    }
                                 }
                                 break
                             } catch (e: CancellationException) {

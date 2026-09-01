@@ -321,6 +321,7 @@ class DownloadViewModel(
                                         remove(audio)
                                         add(VideoQuality(VideoQuality.AUDIO_ONLY_QUALITY, audio.resolution, audio.frameRate, audio.bitrate, audio.codecs, audio.url))
                                     }
+                                    add(VideoQuality(VideoQuality.CHAT_ONLY_QUALITY))
                                 }
                         } else {
                             if (!animatedPreviewUrl.isNullOrBlank()) {
@@ -360,6 +361,7 @@ class DownloadViewModel(
                                             remove(audio)
                                             add(VideoQuality(VideoQuality.AUDIO_ONLY_QUALITY, audio.resolution, audio.frameRate, audio.bitrate, audio.codecs, audio.url))
                                         }
+                                        add(VideoQuality(VideoQuality.CHAT_ONLY_QUALITY))
                                     }
                             } else {
                                 throw IllegalAccessException()

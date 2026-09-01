@@ -507,8 +507,8 @@ class DownloadDialog : DialogFragment(), IntegrityDialog.Listener {
                     )?.second
                     else -> null
                 }
-                if (quality?.name != null && quality.url != null && !path.isNullOrBlank()) {
-                    val downloadChat = downloadChat.isChecked
+                if (quality?.name != null && (quality.url != null || quality.name == VideoQuality.CHAT_ONLY_QUALITY) && !path.isNullOrBlank()) {
+                    val downloadChat = downloadChat.isChecked || quality.name == VideoQuality.CHAT_ONLY_QUALITY
                     val downloadChatEmotes = downloadChatEmotes.isChecked
                     when (type) {
                         STREAM -> {
