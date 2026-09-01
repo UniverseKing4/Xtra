@@ -613,7 +613,7 @@ class DownloadDialog : DialogFragment(), IntegrityDialog.Listener {
                                 gameId = requireArguments().getString(KEY_GAME_ID),
                                 gameSlug = requireArguments().getString(KEY_GAME_SLUG),
                                 gameName = requireArguments().getString(KEY_GAME_NAME),
-                                url = quality.url,
+                                url = quality.url!!,
                                 downloadPath = path,
                                 quality = quality.name,
                                 downloadChat = downloadChat,
