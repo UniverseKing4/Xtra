@@ -55,7 +55,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import okhttp3.Credentials
@@ -1911,25 +1910,26 @@ class MediaPlayerService : BasePlaybackService() {
     private fun savePosition() {
         player?.let { player ->
             if (player.duration != -1) {
-                if (prefs().getBoolean(C.PLAYER_USE_VIDEO_POSITIONS, true)) {
-                    when (type) {
-                        VIDEO -> {
-                            videoId?.toLongOrNull()?.let {
-                                runBlocking {
-                                    xtraModule.playerRepository.saveVideoPosition(VideoPosition(it, player.currentPosition.toLong()))
+                val capturedType = type
+                val capturedVideoId = videoId
+                val capturedOfflineVideoId = offlineVideoId
+                val capturedPosition = player.currentPosition.toLong()
+                val savePositions = prefs().getBoolean(C.PLAYER_USE_VIDEO_POSITIONS, true)
+                lifecycleScope.launch(Dispatchers.IO) {
+                    if (savePositions) {
+                        when (capturedType) {
+                            VIDEO -> {
+                                capturedVideoId?.toLongOrNull()?.let {
+                                    xtraModule.playerRepository.saveVideoPosition(VideoPosition(it, capturedPosition))
                                 }
                             }
-                        }
-                        OFFLINE_VIDEO -> {
-                            offlineVideoId?.let {
-                                runBlocking {
-                                    xtraModule.offlineVideosRepository.updatePosition(it, player.currentPosition.toLong())
+                            OFFLINE_VIDEO -> {
+                                capturedOfflineVideoId?.let {
+                                    xtraModule.offlineVideosRepository.updatePosition(it, capturedPosition)
                                 }
                             }
                         }
                     }
-                }
-                runBlocking {
                     xtraModule.playerRepository.deletePlaybackStates()
                 }
             }
@@ -1976,26 +1976,27 @@ class MediaPlayerService : BasePlaybackService() {
                 val savedPosition = lastSavedPosition
                 if (savedPosition == null || currentPosition - savedPosition !in 0..2000) {
                     lastSavedPosition = currentPosition
-                    if (prefs().getBoolean(C.PLAYER_USE_VIDEO_POSITIONS, true)) {
-                        when (type) {
-                            VIDEO -> {
-                                videoId?.toLongOrNull()?.let {
-                                    runBlocking {
+                    val capturedType = type
+                    val capturedVideoId = videoId
+                    val capturedOfflineVideoId = offlineVideoId
+                    val capturedPaused = !player.isPlaying
+                    val savePositions = prefs().getBoolean(C.PLAYER_USE_VIDEO_POSITIONS, true)
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        if (savePositions) {
+                            when (capturedType) {
+                                VIDEO -> {
+                                    capturedVideoId?.toLongOrNull()?.let {
                                         xtraModule.playerRepository.saveVideoPosition(VideoPosition(it, currentPosition))
                                     }
                                 }
-                            }
-                            OFFLINE_VIDEO -> {
-                                offlineVideoId?.let {
-                                    runBlocking {
+                                OFFLINE_VIDEO -> {
+                                    capturedOfflineVideoId?.let {
                                         xtraModule.offlineVideosRepository.updatePosition(it, currentPosition)
                                     }
                                 }
                             }
                         }
-                    }
-                    runBlocking {
-                        savePlaybackState(currentPosition, !player.isPlaying)
+                        savePlaybackState(currentPosition, capturedPaused)
                     }
                 }
             }
