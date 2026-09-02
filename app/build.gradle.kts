@@ -13,11 +13,23 @@ kotlin {
 
 android {
     signingConfigs {
+        create("release") {
+            keyAlias = "debug"
+            keyPassword = "123456"
+            storeFile = file("debug-keystore.jks")
+            storePassword = "123456"
+            enableV1Signing = true
+            enableV2Signing = true
+            enableV3Signing = true
+        }
         getByName("debug") {
             keyAlias = "debug"
             keyPassword = "123456"
             storeFile = file("debug-keystore.jks")
             storePassword = "123456"
+            enableV1Signing = true
+            enableV2Signing = true
+            enableV3Signing = true
         }
     }
     namespace = "com.github.andreyasadchy.xtra"
@@ -41,7 +53,7 @@ android {
             isShrinkResources = true
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("release")
         }
     }
     buildFeatures {
