@@ -37,6 +37,7 @@ import com.github.andreyasadchy.xtra.util.C
 import com.github.andreyasadchy.xtra.util.NetworkUtils
 import com.github.andreyasadchy.xtra.util.NetworkUtils.executeAsync
 import com.github.andreyasadchy.xtra.util.TwitchApiHelper
+import com.github.andreyasadchy.xtra.util.SafUtils
 import com.github.andreyasadchy.xtra.util.m3u8.MediaPlaylist
 import com.github.andreyasadchy.xtra.util.m3u8.PlaylistUtils
 import com.github.andreyasadchy.xtra.util.m3u8.Segment
@@ -208,6 +209,9 @@ class VideoDownloadService : LifecycleService() {
                                     OfflineVideo.STATUS_PENDING
                                 }
                             }
+                            if (status != OfflineVideo.STATUS_DOWNLOADED && prefs().getBoolean(C.DOWNLOAD_AUTO_RETRY, true)) {
+                                DownloadRetryWorker.enqueueRetry(applicationContext, 15L)
+                            }
                             progress = downloadProgress.progress
                             maxProgress = downloadProgress.maxProgress
                             bytes = downloadProgress.bytes
@@ -306,6 +310,7 @@ class VideoDownloadService : LifecycleService() {
     }
 
     private suspend fun downloadByteArray(networkLibrary: String?, url: String): ByteArray = withContext(Dispatchers.IO) {
+        val userAgent = "Xtra/" + com.github.andreyasadchy.xtra.BuildConfig.VERSION_NAME
         when {
             networkLibrary == C.HTTP_ENGINE && xtraModule.httpEngine.value != null -> @SuppressLint("NewApi") {
                 val response = suspendCancellableCoroutine { continuation ->
@@ -314,7 +319,7 @@ class VideoDownloadService : LifecycleService() {
                         url,
                         xtraModule.cronetExecutor.value,
                         NetworkUtils.ByteArrayUrlCallback(continuation, timeout)
-                    ).build()
+                    ).addHeader("User-Agent", userAgent).build()
                     timeout.start(request, continuation)
                     request.start()
                     continuation.invokeOnCancellation {
@@ -335,7 +340,7 @@ class VideoDownloadService : LifecycleService() {
                         url,
                         NetworkUtils.ByteArrayCronetCallback(continuation, timeout),
                         xtraModule.cronetExecutor.value
-                    ).build()
+                    ).addHeader("User-Agent", userAgent).build()
                     timeout.start(request, continuation)
                     request.start()
                     continuation.invokeOnCancellation {
@@ -350,7 +355,12 @@ class VideoDownloadService : LifecycleService() {
                 }
             }
             else -> {
-                okHttpClient.value.newCall(Request.Builder().url(url).build()).executeAsync().use { response ->
+                okHttpClient.value.newCall(
+                    Request.Builder()
+                        .url(url)
+                        .header("User-Agent", userAgent)
+                        .build()
+                ).executeAsync().use { response ->
                     if (response.isSuccessful) {
                         response.body.source().readByteArray()
                     } else {
@@ -490,37 +500,13 @@ class VideoDownloadService : LifecycleService() {
         playlist: MediaPlaylist,
         segments: List<Segment>
     ) = withContext(Dispatchers.IO) {
-        val isShared = path.toUri().scheme == ContentResolver.SCHEME_CONTENT
-        val videoFileUri = if (!offlineVideo.url.isNullOrBlank()) {
+        val videoFileUri = if (!offlineVideo.url.isNullOrBlank() && SafUtils.fileExists(contentResolver, offlineVideo.url!!)) {
             val fileUri = offlineVideo.url!!
-            if (isShared) {
-                contentResolver.openFileDescriptor(fileUri.toUri(), "rw")?.use {
-                    FileOutputStream(it.fileDescriptor).channel.truncate(downloadProgress.bytes)
-                }
-            } else {
-                val file = File(fileUri)
-                if (file.exists()) {
-                    RandomAccessFile(file, "rw").use {
-                        it.setLength(downloadProgress.bytes)
-                    }
-                }
-            }
+            SafUtils.truncateFile(contentResolver, fileUri, downloadProgress.bytes)
             fileUri
         } else {
             val fileName = "${offlineVideo.videoId ?: ""}${offlineVideo.quality ?: ""}${offlineVideo.downloadDate}.${segments.firstOrNull()?.uri?.substringAfterLast(".") ?: "ts"}"
-            val fileUri = if (isShared) {
-                val documentId = DocumentsContract.getTreeDocumentId(path.toUri())
-                val directoryUri = DocumentsContract.buildDocumentUriUsingTree(path.toUri(), documentId)
-                val fileUri = directoryUri.toString() + (if (!directoryUri.toString().endsWith("%3A")) "%2F" else "") + fileName
-                try {
-                    contentResolver.openOutputStream(fileUri.toUri())?.close()
-                } catch (e: IllegalArgumentException) {
-                    DocumentsContract.createDocument(contentResolver, directoryUri, "", fileName)
-                }
-                fileUri
-            } else {
-                "$path${File.separator}$fileName"
-            }
+            val fileUri = SafUtils.getOrCreateDocument(contentResolver, path, fileName, "video/mp2t")
             var initSegmentBytes: Long? = null
             if (playlist.initSegmentUri != null) {
                 val initUrl = if (playlist.initSegmentUri.startsWith("http://") || playlist.initSegmentUri.startsWith("https://")) {
@@ -529,11 +515,7 @@ class VideoDownloadService : LifecycleService() {
                     urlPath + playlist.initSegmentUri
                 }
                 val initData = downloadByteArray(networkLibrary, initUrl)
-                if (isShared) {
-                    contentResolver.openOutputStream(fileUri.toUri(), "wa")!!
-                } else {
-                    FileOutputStream(fileUri, true)
-                }.use {
+                SafUtils.openOutputStream(contentResolver, fileUri, append = true).use {
                     it.write(initData)
                 }
                 initSegmentBytes = initData.size.toLong()
@@ -573,11 +555,7 @@ class VideoDownloadService : LifecycleService() {
                 while (nextIndex < segments.size) {
                     val bytes = readySegments.remove(nextIndex)
                     if (bytes != null) {
-                        if (isShared) {
-                            contentResolver.openOutputStream(videoFileUri.toUri(), "wa")!!
-                        } else {
-                            FileOutputStream(videoFileUri, true)
-                        }.use {
+                        SafUtils.openOutputStream(contentResolver, videoFileUri, append = true).use {
                             it.write(bytes)
                         }
                         downloadProgress.bytes += bytes.size
@@ -627,7 +605,29 @@ class VideoDownloadService : LifecycleService() {
                                 if (segmentRetries > 0) {
                                     delay(1000L)
                                 } else {
-                                    throw e
+                                    if (segmentUrl.contains("-muted")) {
+                                        try {
+                                            segmentBytes = downloadByteArray(networkLibrary, segmentUrl.replace("-muted", "-unmuted"))
+                                        } catch (e2: Exception) {
+                                            try {
+                                                segmentBytes = downloadByteArray(networkLibrary, segmentUrl.replace("-muted", ""))
+                                            } catch (e3: Exception) {
+                                                throw e
+                                            }
+                                        }
+                                    } else if (segmentUrl.contains("-unmuted")) {
+                                        try {
+                                            segmentBytes = downloadByteArray(networkLibrary, segmentUrl.replace("-unmuted", "-muted"))
+                                        } catch (e2: Exception) {
+                                            try {
+                                                segmentBytes = downloadByteArray(networkLibrary, segmentUrl.replace("-unmuted", ""))
+                                            } catch (e3: Exception) {
+                                                throw e
+                                            }
+                                        }
+                                    } else {
+                                        throw e
+                                    }
                                 }
                             }
                         }
@@ -641,8 +641,9 @@ class VideoDownloadService : LifecycleService() {
                 }
             }
 
-            writerJob.join()
             downloadJobs.joinAll()
+            segmentAvailableChannel.trySend(Unit)
+            writerJob.join()
             chatJob?.join()
         }
     }
@@ -656,76 +657,35 @@ class VideoDownloadService : LifecycleService() {
         playlist: MediaPlaylist,
         segments: List<Segment>
     ) = withContext(Dispatchers.IO) {
-        val isShared = path.toUri().scheme == ContentResolver.SCHEME_CONTENT
         val videoDirectoryName = if (!offlineVideo.videoId.isNullOrBlank()) {
             "${offlineVideo.videoId}${offlineVideo.quality ?: ""}"
         } else {
             "${offlineVideo.downloadDate}"
         }
-        val videoDirectoryUri = if (isShared) {
-            val documentId = DocumentsContract.getTreeDocumentId(path.toUri())
-            val directoryUri = DocumentsContract.buildDocumentUriUsingTree(path.toUri(), documentId)
-            val videoDirUri = directoryUri.toString() + (if (!directoryUri.toString().endsWith("%3A")) "%2F" else "") + videoDirectoryName
-            try {
-                contentResolver.openOutputStream(videoDirUri.toUri())?.close()
-            } catch (e: Exception) {
-                if (e is IllegalArgumentException) {
-                    DocumentsContract.createDocument(contentResolver, directoryUri, DocumentsContract.Document.MIME_TYPE_DIR, videoDirectoryName)
-                }
-            }
-            videoDirUri
-        } else {
-            val videoDirUri = "$path${File.separator}$videoDirectoryName${File.separator}"
-            File(videoDirUri).mkdir()
-            videoDirUri
-        }
-        val playlistFileUri = if (!offlineVideo.url.isNullOrBlank()) {
+        val (videoDirectoryUri, videoDirDocId) = SafUtils.getOrCreateDirectory(contentResolver, path, videoDirectoryName)
+        val playlistFileUri = if (!offlineVideo.url.isNullOrBlank() && SafUtils.fileExists(contentResolver, offlineVideo.url!!)) {
             offlineVideo.url!!
         } else {
-            val pFileUri = if (isShared) {
-                val fileName = "${offlineVideo.downloadDate}.m3u8"
-                val fileUri = "$videoDirectoryUri%2F$fileName"
-                try {
-                    contentResolver.openOutputStream(fileUri.toUri())!!
-                } catch (e: IllegalArgumentException) {
-                    DocumentsContract.createDocument(contentResolver, videoDirectoryUri.toUri(), "", fileName)
-                    contentResolver.openOutputStream(fileUri.toUri())!!
-                }.use {
-                    PlaylistUtils.writeMediaPlaylist(playlist.copy(
-                        initSegmentUri = playlist.initSegmentUri?.let { uri -> "$videoDirectoryUri%2F$uri" },
-                        segments = segments.map { segment -> segment.copy(uri = videoDirectoryUri + "%2F" + segment.uri) }
-                    ), it)
-                }
-                fileUri
-            } else {
-                val fileUri = "$videoDirectoryUri${offlineVideo.downloadDate}.m3u8"
-                FileOutputStream(fileUri).use {
-                    PlaylistUtils.writeMediaPlaylist(playlist.copy(segments = segments), it)
-                }
-                fileUri
+            val fileName = "${offlineVideo.downloadDate}.m3u8"
+            val pFileUri = SafUtils.getOrCreateChildDocument(contentResolver, path, videoDirDocId, fileName, "application/x-mpegURL")
+            SafUtils.openOutputStream(contentResolver, pFileUri, append = false).use {
+                PlaylistUtils.writeMediaPlaylist(playlist.copy(
+                    initSegmentUri = playlist.initSegmentUri?.let { uri -> SafUtils.getOrCreateChildDocument(contentResolver, path, videoDirDocId, uri, "video/mp4") },
+                    segments = segments.map { segment ->
+                        val childUri = SafUtils.getOrCreateChildDocument(contentResolver, path, videoDirDocId, segment.uri, "video/mp2t")
+                        segment.copy(uri = childUri)
+                    }
+                ), it)
             }
             if (playlist.initSegmentUri != null) {
-                val initSegmentFileUri = if (isShared) {
-                    videoDirectoryUri + "%2F" + playlist.initSegmentUri
-                } else {
-                    videoDirectoryUri + playlist.initSegmentUri
-                }
+                val initSegmentFileUri = SafUtils.getOrCreateChildDocument(contentResolver, path, videoDirDocId, playlist.initSegmentUri, "video/mp4")
                 val initUrl = if (playlist.initSegmentUri.startsWith("http://") || playlist.initSegmentUri.startsWith("https://")) {
                     playlist.initSegmentUri
                 } else {
                     urlPath + playlist.initSegmentUri
                 }
                 val initData = downloadByteArray(networkLibrary, initUrl)
-                if (isShared) {
-                    try {
-                        contentResolver.openOutputStream(initSegmentFileUri.toUri())!!
-                    } catch (e: IllegalArgumentException) {
-                        DocumentsContract.createDocument(contentResolver, videoDirectoryUri.toUri(), "", playlist.initSegmentUri)
-                        contentResolver.openOutputStream(initSegmentFileUri.toUri())!!
-                    }
-                } else {
-                    FileOutputStream(initSegmentFileUri)
-                }.use {
+                SafUtils.openOutputStream(contentResolver, initSegmentFileUri, append = false).use {
                     it.write(initData)
                 }
             }
@@ -735,17 +695,17 @@ class VideoDownloadService : LifecycleService() {
             pFileUri
         }
         val downloadedSegments = mutableListOf<String>()
-        if (isShared) {
+        if (SafUtils.isContentUri(path)) {
             val playlists = xtraModule.offlineVideosRepository.getPlaylists().mapNotNull { video ->
                 video.url?.takeIf {
-                    it.toUri().scheme == ContentResolver.SCHEME_CONTENT
+                    SafUtils.isContentUri(it)
                             && it.substringBeforeLast("%2F") == videoDirectoryUri
                             && it != playlistFileUri
                 }
             }
             playlists.forEach { uri ->
                 try {
-                    val p = contentResolver.openInputStream(uri.toUri())!!.use {
+                    val p = SafUtils.openInputStream(contentResolver, uri).use {
                         PlaylistUtils.parseMediaPlaylist(it)
                     }
                     p.segments.forEach { downloadedSegments.add(it.uri.substringAfterLast("%2F").substringAfterLast("/")) }
@@ -784,21 +744,8 @@ class VideoDownloadService : LifecycleService() {
                 launch(Dispatchers.IO) {
                     requestSemaphore.acquire()
                     try {
-                        val fileUri = if (isShared) {
-                            videoDirectoryUri + "%2F" + segment.uri
-                        } else {
-                            videoDirectoryUri + segment.uri
-                        }
-                        val exists = if (isShared) {
-                            try {
-                                contentResolver.openOutputStream(fileUri.toUri())?.close()
-                                true
-                            } catch (e: IllegalArgumentException) {
-                                false
-                            }
-                        } else {
-                            File(fileUri).exists()
-                        }
+                        val fileUri = SafUtils.getOrCreateChildDocument(contentResolver, path, videoDirDocId, segment.uri, "video/mp2t")
+                        val exists = SafUtils.fileExists(contentResolver, fileUri)
                         if (!exists || !downloadedSegments.contains(segment.uri)) {
                             val segmentUrl = if (segment.uri.startsWith("http://") || segment.uri.startsWith("https://")) {
                                 segment.uri
@@ -817,21 +764,34 @@ class VideoDownloadService : LifecycleService() {
                                     if (segmentRetries > 0) {
                                         delay(1000L)
                                     } else {
-                                        throw e
+                                        if (segmentUrl.contains("-muted")) {
+                                            try {
+                                                segmentBytes = downloadByteArray(networkLibrary, segmentUrl.replace("-muted", "-unmuted"))
+                                            } catch (e2: Exception) {
+                                                try {
+                                                    segmentBytes = downloadByteArray(networkLibrary, segmentUrl.replace("-muted", ""))
+                                                } catch (e3: Exception) {
+                                                    throw e
+                                                }
+                                            }
+                                        } else if (segmentUrl.contains("-unmuted")) {
+                                            try {
+                                                segmentBytes = downloadByteArray(networkLibrary, segmentUrl.replace("-unmuted", "-muted"))
+                                            } catch (e2: Exception) {
+                                                try {
+                                                    segmentBytes = downloadByteArray(networkLibrary, segmentUrl.replace("-unmuted", ""))
+                                                } catch (e3: Exception) {
+                                                    throw e
+                                                }
+                                            }
+                                        } else {
+                                            throw e
+                                        }
                                     }
                                 }
                             }
                             if (segmentBytes != null) {
-                                if (isShared) {
-                                    try {
-                                        contentResolver.openOutputStream(fileUri.toUri())!!
-                                    } catch (e: IllegalArgumentException) {
-                                        DocumentsContract.createDocument(contentResolver, videoDirectoryUri.toUri(), "", segment.uri)
-                                        contentResolver.openOutputStream(fileUri.toUri())!!
-                                    }
-                                } else {
-                                    FileOutputStream(fileUri)
-                                }.use {
+                                SafUtils.openOutputStream(contentResolver, fileUri, append = false).use {
                                     it.write(segmentBytes)
                                 }
                             }
@@ -867,8 +827,7 @@ class VideoDownloadService : LifecycleService() {
     private suspend fun downloadClip(offlineVideo: OfflineVideo, downloadProgress: DownloadProgress, sourceUrl: String) = withContext(Dispatchers.IO) {
         val networkLibrary = prefs().getString(C.NETWORK_LIBRARY, C.OKHTTP)
         val path = offlineVideo.downloadPath!!
-        val isShared = path.toUri().scheme == ContentResolver.SCHEME_CONTENT
-        val videoFileUri = if (!offlineVideo.url.isNullOrBlank()) {
+        val videoFileUri = if (!offlineVideo.url.isNullOrBlank() && SafUtils.fileExists(contentResolver, offlineVideo.url!!)) {
             offlineVideo.url!!
         } else {
             val fileName = if (!offlineVideo.clipId.isNullOrBlank()) {
@@ -876,19 +835,7 @@ class VideoDownloadService : LifecycleService() {
             } else {
                 "${offlineVideo.downloadDate}.mp4"
             }
-            val fileUri = if (isShared) {
-                val documentId = DocumentsContract.getTreeDocumentId(path.toUri())
-                val directoryUri = DocumentsContract.buildDocumentUriUsingTree(path.toUri(), documentId)
-                val fileUri = directoryUri.toString() + (if (!directoryUri.toString().endsWith("%3A")) "%2F" else "") + fileName
-                try {
-                    contentResolver.openOutputStream(fileUri.toUri())?.close()
-                } catch (e: IllegalArgumentException) {
-                    DocumentsContract.createDocument(contentResolver, directoryUri, "", fileName)
-                }
-                fileUri
-            } else {
-                "$path${File.separator}$fileName"
-            }
+            val fileUri = SafUtils.getOrCreateDocument(contentResolver, path, fileName, "video/mp4")
             xtraModule.offlineVideosRepository.update(offlineVideo.apply {
                 url = fileUri
             })
@@ -911,12 +858,7 @@ class VideoDownloadService : LifecycleService() {
             }
 
             if (downloadProgress.progress < downloadProgress.maxProgress) {
-                val outputStream = if (isShared) {
-                    contentResolver.openOutputStream(videoFileUri.toUri())!!
-                } else {
-                    FileOutputStream(videoFileUri)
-                }
-                outputStream.use { out ->
+                SafUtils.openOutputStream(contentResolver, videoFileUri, append = false).use { out ->
                     var lastUpdate = System.currentTimeMillis()
                     downloadToStream(networkLibrary, sourceUrl, out) { bytesRead, totalBytes ->
                         downloadProgress.bytes = bytesRead
@@ -944,28 +886,15 @@ class VideoDownloadService : LifecycleService() {
         if ((offlineVideo.downloadChat || isChatOnly) && downloadProgress.chatProgress < downloadProgress.maxChatProgress) {
             val videoId = offlineVideo.videoId
             if (videoId != null) {
-                val isShared = path.toUri().scheme == ContentResolver.SCHEME_CONTENT
                 val startTimeSeconds = (offlineVideo.sourceStartPosition?.div(1000L) ?: 0L).toInt()
                 val durationSeconds = (offlineVideo.duration?.div(1000L) ?: 0L).toInt().coerceAtLeast(1)
                 val endTimeSeconds = startTimeSeconds + durationSeconds
                 val resumed = !offlineVideo.chatUrl.isNullOrBlank() && downloadProgress.chatBytes > 0
-                val fileUri = if (resumed) {
+                val fileUri = if (resumed && SafUtils.fileExists(contentResolver, offlineVideo.chatUrl!!)) {
                     offlineVideo.chatUrl!!
                 } else {
                     val fileName = "${videoId}${offlineVideo.quality ?: ""}${offlineVideo.downloadDate}_chat.json"
-                    val fileUri = if (isShared) {
-                        val documentId = DocumentsContract.getTreeDocumentId(path.toUri())
-                        val directoryUri = DocumentsContract.buildDocumentUriUsingTree(path.toUri(), documentId)
-                        val fileUri = directoryUri.toString() + (if (!directoryUri.toString().endsWith("%3A")) "%2F" else "") + fileName
-                        try {
-                            contentResolver.openOutputStream(fileUri.toUri())?.close()
-                        } catch (e: IllegalArgumentException) {
-                            DocumentsContract.createDocument(contentResolver, directoryUri, "", fileName)
-                        }
-                        fileUri
-                    } else {
-                        "$path${File.separator}$fileName"
-                    }
+                    val fileUri = SafUtils.getOrCreateDocument(contentResolver, path, fileName, "application/json")
                     xtraModule.offlineVideosRepository.update(offlineVideo.apply {
                         maxChatProgress = durationSeconds
                         chatOffsetSeconds = startTimeSeconds
@@ -1100,167 +1029,136 @@ class VideoDownloadService : LifecycleService() {
                 val savedBadges = mutableListOf<Pair<String, String>>()
                 val savedEmotes = mutableListOf<String>()
                 if (resumed) {
-                    if (isShared) {
-                        contentResolver.openFileDescriptor(fileUri.toUri(), "rw")?.use {
-                            FileOutputStream(it.fileDescriptor).channel.truncate(downloadProgress.chatBytes)
-                        }
-                    } else {
-                        val file = File(fileUri)
-                        if (file.exists()) {
-                            RandomAccessFile(file, "rw").use {
-                                it.setLength(downloadProgress.chatBytes)
-                            }
-                        }
-                    }
-                    if (isShared) {
-                        contentResolver.openOutputStream(fileUri.toUri(), "wa")!!.bufferedWriter()
-                    } else {
-                        FileOutputStream(fileUri, true).bufferedWriter()
-                    }.use { writer ->
+                    SafUtils.truncateFile(contentResolver, fileUri, downloadProgress.chatBytes)
+                    SafUtils.openOutputStream(contentResolver, fileUri, append = true).bufferedWriter().use { writer ->
                         writer.write("}")
                     }
-                    if (isShared) {
-                        contentResolver.openInputStream(fileUri.toUri())?.bufferedReader()
-                    } else {
-                        val file = File(fileUri)
-                        if (file.exists()) FileInputStream(file).bufferedReader() else null
-                    }?.use { fileReader ->
-                        JsonReader(fileReader).use { reader ->
-                            reader.isLenient = true
-                            var token: JsonToken
-                            do {
-                                token = reader.peek()
-                                when (token) {
-                                    JsonToken.END_DOCUMENT -> {}
-                                    JsonToken.BEGIN_OBJECT -> {
-                                        reader.beginObject()
-                                        while (reader.hasNext()) {
-                                            when (reader.peek()) {
-                                                JsonToken.NAME -> {
-                                                    when (reader.nextName()) {
-                                                        "comments" -> {
-                                                            reader.beginArray()
-                                                            while (reader.hasNext()) {
-                                                                reader.beginObject()
-                                                                var id: String? = null
+                    try {
+                        SafUtils.openInputStream(contentResolver, fileUri).bufferedReader().use { fileReader ->
+                            JsonReader(fileReader).use { reader ->
+                                reader.isLenient = true
+                                var token: JsonToken
+                                do {
+                                    token = reader.peek()
+                                    when (token) {
+                                        JsonToken.END_DOCUMENT -> {}
+                                        JsonToken.BEGIN_OBJECT -> {
+                                            reader.beginObject()
+                                            while (reader.hasNext()) {
+                                                when (reader.peek()) {
+                                                    JsonToken.NAME -> {
+                                                        when (reader.nextName()) {
+                                                            "comments" -> {
+                                                                reader.beginArray()
                                                                 while (reader.hasNext()) {
-                                                                    when (reader.nextName()) {
-                                                                        "id" -> id = reader.nextString()
-                                                                        else -> reader.skipValue()
+                                                                    reader.beginObject()
+                                                                    var id: String? = null
+                                                                    while (reader.hasNext()) {
+                                                                        when (reader.nextName()) {
+                                                                            "id" -> id = reader.nextString()
+                                                                            else -> reader.skipValue()
+                                                                        }
                                                                     }
+                                                                    if (!id.isNullOrBlank()) {
+                                                                        latestSavedMessageIds.add(id)
+                                                                    }
+                                                                    reader.endObject()
                                                                 }
-                                                                if (!id.isNullOrBlank()) {
-                                                                    latestSavedMessageIds.add(id)
-                                                                }
-                                                                reader.endObject()
+                                                                reader.endArray()
                                                             }
-                                                            reader.endArray()
-                                                        }
-                                                        "twitchEmotes" -> {
-                                                            reader.beginArray()
-                                                            while (reader.hasNext()) {
-                                                                reader.beginObject()
-                                                                var id: String? = null
+                                                            "twitchEmotes" -> {
+                                                                reader.beginArray()
                                                                 while (reader.hasNext()) {
-                                                                    when (reader.nextName()) {
-                                                                        "id" -> id = reader.nextString()
-                                                                        else -> reader.skipValue()
+                                                                    reader.beginObject()
+                                                                    var id: String? = null
+                                                                    while (reader.hasNext()) {
+                                                                        when (reader.nextName()) {
+                                                                            "id" -> id = reader.nextString()
+                                                                            else -> reader.skipValue()
+                                                                        }
                                                                     }
+                                                                    if (!id.isNullOrBlank()) {
+                                                                        savedTwitchEmotes.add(id)
+                                                                    }
+                                                                    reader.endObject()
                                                                 }
-                                                                if (!id.isNullOrBlank()) {
-                                                                    savedTwitchEmotes.add(id)
-                                                                }
-                                                                reader.endObject()
+                                                                reader.endArray()
                                                             }
-                                                            reader.endArray()
-                                                        }
-                                                        "twitchBadges" -> {
-                                                            reader.beginArray()
-                                                            while (reader.hasNext()) {
-                                                                reader.beginObject()
-                                                                var setId: String? = null
-                                                                var version: String? = null
+                                                            "twitchBadges" -> {
+                                                                reader.beginArray()
                                                                 while (reader.hasNext()) {
-                                                                    when (reader.nextName()) {
-                                                                        "setId" -> setId = reader.nextString()
-                                                                        "version" -> version = reader.nextString()
-                                                                        else -> reader.skipValue()
+                                                                    reader.beginObject()
+                                                                    var setId: String? = null
+                                                                    var version: String? = null
+                                                                    while (reader.hasNext()) {
+                                                                        when (reader.nextName()) {
+                                                                            "setId" -> setId = reader.nextString()
+                                                                            "version" -> version = reader.nextString()
+                                                                            else -> reader.skipValue()
+                                                                        }
                                                                     }
+                                                                    if (!setId.isNullOrBlank() && !version.isNullOrBlank()) {
+                                                                        savedBadges.add(Pair(setId, version))
+                                                                    }
+                                                                    reader.endObject()
                                                                 }
-                                                                if (!setId.isNullOrBlank() && !version.isNullOrBlank()) {
-                                                                    savedBadges.add(Pair(setId, version))
-                                                                }
-                                                                reader.endObject()
+                                                                reader.endArray()
                                                             }
-                                                            reader.endArray()
-                                                        }
-                                                        "cheerEmotes" -> {
-                                                            reader.beginArray()
-                                                            while (reader.hasNext()) {
-                                                                reader.beginObject()
-                                                                var name: String? = null
+                                                            "cheerEmotes" -> {
+                                                                reader.beginArray()
                                                                 while (reader.hasNext()) {
-                                                                    when (reader.nextName()) {
-                                                                        "name" -> name = reader.nextString()
-                                                                        else -> reader.skipValue()
+                                                                    reader.beginObject()
+                                                                    var name: String? = null
+                                                                    while (reader.hasNext()) {
+                                                                        when (reader.nextName()) {
+                                                                            "name" -> name = reader.nextString()
+                                                                            else -> reader.skipValue()
+                                                                        }
                                                                     }
+                                                                    if (!name.isNullOrBlank()) {
+                                                                        savedEmotes.add(name)
+                                                                    }
+                                                                    reader.endObject()
                                                                 }
-                                                                if (!name.isNullOrBlank()) {
-                                                                    savedEmotes.add(name)
-                                                                }
-                                                                reader.endObject()
+                                                                reader.endArray()
                                                             }
-                                                            reader.endArray()
-                                                        }
-                                                        "emotes" -> {
-                                                            reader.beginArray()
-                                                            while (reader.hasNext()) {
-                                                                reader.beginObject()
-                                                                var name: String? = null
+                                                            "emotes" -> {
+                                                                reader.beginArray()
                                                                 while (reader.hasNext()) {
-                                                                    when (reader.nextName()) {
-                                                                        "name" -> name = reader.nextString()
-                                                                        else -> reader.skipValue()
+                                                                    reader.beginObject()
+                                                                    var name: String? = null
+                                                                    while (reader.hasNext()) {
+                                                                        when (reader.nextName()) {
+                                                                            "name" -> name = reader.nextString()
+                                                                            else -> reader.skipValue()
+                                                                        }
                                                                     }
+                                                                    if (!name.isNullOrBlank()) {
+                                                                        savedEmotes.add(name)
+                                                                    }
+                                                                    reader.endObject()
                                                                 }
-                                                                if (!name.isNullOrBlank()) {
-                                                                    savedEmotes.add(name)
-                                                                }
-                                                                reader.endObject()
+                                                                reader.endArray()
                                                             }
-                                                            reader.endArray()
+                                                            else -> reader.skipValue()
                                                         }
-                                                        else -> reader.skipValue()
                                                     }
+                                                    else -> reader.skipValue()
                                                 }
-                                                else -> reader.skipValue()
                                             }
+                                            reader.endObject()
                                         }
-                                        reader.endObject()
+                                        else -> reader.skipValue()
                                     }
-                                    else -> reader.skipValue()
-                                }
-                            } while (token != JsonToken.END_DOCUMENT)
-                        }
-                    }
-                    if (isShared) {
-                        contentResolver.openFileDescriptor(fileUri.toUri(), "rw")?.use {
-                            FileOutputStream(it.fileDescriptor).channel.truncate(downloadProgress.chatBytes)
-                        }
-                    } else {
-                        val file = File(fileUri)
-                        if (file.exists()) {
-                            RandomAccessFile(file, "rw").use {
-                                it.setLength(downloadProgress.chatBytes)
+                                } while (token != JsonToken.END_DOCUMENT)
                             }
                         }
+                    } catch (e: Exception) {
+                        Log.w("VideoDownloadService", "Error parsing existing chat json", e)
                     }
+                    SafUtils.truncateFile(contentResolver, fileUri, downloadProgress.chatBytes)
                 } else {
-                    if (isShared) {
-                        contentResolver.openOutputStream(fileUri.toUri())!!.bufferedWriter()
-                    } else {
-                        FileOutputStream(fileUri).bufferedWriter()
-                    }.use { writer ->
+                    SafUtils.openOutputStream(contentResolver, fileUri, append = false).bufferedWriter().use { writer ->
                         writer.write("{".also { position += 1 })
                         writer.write("\"video\":".also { position += it.length })
                         writer.write(
@@ -1294,11 +1192,7 @@ class VideoDownloadService : LifecycleService() {
                     }
                     val comments = response?.data?.video?.comments
                     if (comments == null) {
-                        if (isShared) {
-                            contentResolver.openOutputStream(fileUri.toUri(), "wa")!!.bufferedWriter()
-                        } else {
-                            FileOutputStream(fileUri, true).bufferedWriter()
-                        }.use { writer ->
+                        SafUtils.openOutputStream(contentResolver, fileUri, append = true).bufferedWriter().use { writer ->
                             writer.write("}".also { position += 1 })
                         }
                         downloadProgress.chatProgress = downloadProgress.maxChatProgress
@@ -1321,11 +1215,7 @@ class VideoDownloadService : LifecycleService() {
                     }
                     cursor = if (comments.pageInfo?.hasNextPage != false) comments.edges.lastOrNull()?.cursor else null
                     if (messages.isNotEmpty()) {
-                        if (isShared) {
-                            contentResolver.openOutputStream(fileUri.toUri(), "wa")!!.bufferedWriter()
-                        } else {
-                            FileOutputStream(fileUri, true).bufferedWriter()
-                        }.use { writer ->
+                        SafUtils.openOutputStream(contentResolver, fileUri, append = true).bufferedWriter().use { writer ->
                             writer.write(",".also { position += 1 })
                             writer.write("\"comments\":".also { position += it.length })
                             writer.write("[".also { position += 1 })
@@ -1430,11 +1320,7 @@ class VideoDownloadService : LifecycleService() {
                                     }.awaitAll().filterNotNull()
 
                                     if (downloaded.isNotEmpty()) {
-                                        if (isShared) {
-                                            contentResolver.openOutputStream(fileUri.toUri(), "wa")!!.bufferedWriter()
-                                        } else {
-                                            FileOutputStream(fileUri, true).bufferedWriter()
-                                        }.use { writer ->
+                                        SafUtils.openOutputStream(contentResolver, fileUri, append = true).bufferedWriter().use { writer ->
                                             writer.write(",\"twitchEmotes\":[".also { position += it.length })
                                             downloaded.forEachIndexed { index, item ->
                                                 if (index > 0) writer.write(",".also { position += 1 })
@@ -1476,11 +1362,7 @@ class VideoDownloadService : LifecycleService() {
                                     }.awaitAll().filterNotNull()
 
                                     if (downloaded.isNotEmpty()) {
-                                        if (isShared) {
-                                            contentResolver.openOutputStream(fileUri.toUri(), "wa")!!.bufferedWriter()
-                                        } else {
-                                            FileOutputStream(fileUri, true).bufferedWriter()
-                                        }.use { writer ->
+                                        SafUtils.openOutputStream(contentResolver, fileUri, append = true).bufferedWriter().use { writer ->
                                             writer.write(",\"twitchBadges\":[".also { position += it.length })
                                             downloaded.forEachIndexed { index, item ->
                                                 if (index > 0) writer.write(",".also { position += 1 })
@@ -1523,11 +1405,7 @@ class VideoDownloadService : LifecycleService() {
                                     }.awaitAll().filterNotNull()
 
                                     if (downloaded.isNotEmpty()) {
-                                        if (isShared) {
-                                            contentResolver.openOutputStream(fileUri.toUri(), "wa")!!.bufferedWriter()
-                                        } else {
-                                            FileOutputStream(fileUri, true).bufferedWriter()
-                                        }.use { writer ->
+                                        SafUtils.openOutputStream(contentResolver, fileUri, append = true).bufferedWriter().use { writer ->
                                             writer.write(",\"cheerEmotes\":[".also { position += it.length })
                                             downloaded.forEachIndexed { index, item ->
                                                 if (index > 0) writer.write(",".also { position += 1 })
@@ -1569,11 +1447,7 @@ class VideoDownloadService : LifecycleService() {
                                     }.awaitAll().filterNotNull()
 
                                     if (downloaded.isNotEmpty()) {
-                                        if (isShared) {
-                                            contentResolver.openOutputStream(fileUri.toUri(), "wa")!!.bufferedWriter()
-                                        } else {
-                                            FileOutputStream(fileUri, true).bufferedWriter()
-                                        }.use { writer ->
+                                        SafUtils.openOutputStream(contentResolver, fileUri, append = true).bufferedWriter().use { writer ->
                                             writer.write(",\"emotes\":[".also { position += it.length })
                                             downloaded.forEachIndexed { index, item ->
                                                 if (index > 0) writer.write(",".also { position += 1 })
@@ -1612,11 +1486,7 @@ class VideoDownloadService : LifecycleService() {
                             })
                         }
                     } else {
-                        if (isShared) {
-                            contentResolver.openOutputStream(fileUri.toUri(), "wa")!!.bufferedWriter()
-                        } else {
-                            FileOutputStream(fileUri, true).bufferedWriter()
-                        }.use { writer ->
+                        SafUtils.openOutputStream(contentResolver, fileUri, append = true).bufferedWriter().use { writer ->
                             writer.write("}".also { position += 1 })
                         }
                         downloadProgress.chatProgress = downloadProgress.maxChatProgress

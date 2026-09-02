@@ -44,6 +44,7 @@ import com.github.andreyasadchy.xtra.util.TwitchApiHelper
 import com.github.andreyasadchy.xtra.util.chat.ChatReadWebSocket
 import com.github.andreyasadchy.xtra.util.chat.ChatUtils
 import com.github.andreyasadchy.xtra.util.m3u8.PlaylistUtils
+import com.github.andreyasadchy.xtra.util.SafUtils
 import com.github.andreyasadchy.xtra.util.prefs
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -481,23 +482,8 @@ class StreamDownloadService : LifecycleService() {
                     if (done) {
                         if (offlineVideo.downloadChat && !offlineVideo.chatUrl.isNullOrBlank()) {
                             val chatUrl = offlineVideo.chatUrl!!
-                            val isShared = chatUrl.toUri().scheme == ContentResolver.SCHEME_CONTENT
-                            if (isShared) {
-                                contentResolver.openFileDescriptor(chatUrl.toUri(), "rw")!!.use {
-                                    FileOutputStream(it.fileDescriptor).use { output ->
-                                        output.channel.truncate(downloadProgress.chatBytes)
-                                    }
-                                }
-                            } else {
-                                FileOutputStream(chatUrl).use { output ->
-                                    output.channel.truncate(downloadProgress.chatBytes)
-                                }
-                            }
-                            if (isShared) {
-                                contentResolver.openOutputStream(chatUrl.toUri(), "wa")!!.bufferedWriter()
-                            } else {
-                                FileOutputStream(chatUrl, true).bufferedWriter()
-                            }.use { fileWriter ->
+                            SafUtils.truncateFile(contentResolver, chatUrl, downloadProgress.chatBytes)
+                            SafUtils.openOutputStream(contentResolver, chatUrl, append = true).bufferedWriter().use { fileWriter ->
                                 if (downloadProgress.liveCommentsArrayStarted) {
                                     fileWriter.write("]")
                                 }
@@ -846,44 +832,19 @@ class StreamDownloadService : LifecycleService() {
         } else {
             return@withContext
         }
-        val videoFileUri = if (!offlineVideo.url.isNullOrBlank()) {
+        val videoFileUri = if (!offlineVideo.url.isNullOrBlank() && SafUtils.fileExists(contentResolver, offlineVideo.url!!)) {
             val fileUri = offlineVideo.url!!
-            if (isShared) {
-                contentResolver.openFileDescriptor(fileUri.toUri(), "rw")?.use {
-                    FileOutputStream(it.fileDescriptor).channel.truncate(downloadProgress.bytes)
-                }
-            } else {
-                val file = File(fileUri)
-                if (file.exists()) {
-                    RandomAccessFile(file, "rw").use {
-                        it.setLength(downloadProgress.bytes)
-                    }
-                }
-            }
+            SafUtils.truncateFile(contentResolver, fileUri, downloadProgress.bytes)
             fileUri
         } else {
-            val fileName = "${offlineVideo.channelLogin ?: ""}${offlineVideo.quality ?: ""}${downloadDate}.${firstUrls.first().substringAfterLast(".").substringBefore("?")}"
-            val fileUri = if (isShared) {
-                val documentId = DocumentsContract.getTreeDocumentId(path.toUri())
-                val directoryUri = DocumentsContract.buildDocumentUriUsingTree(path.toUri(), documentId)
-                val fileUri = directoryUri.toString() + (if (!directoryUri.toString().endsWith("%3A")) "%2F" else "") + fileName
-                try {
-                    contentResolver.openOutputStream(fileUri.toUri())?.close()
-                } catch (e: IllegalArgumentException) {
-                    DocumentsContract.createDocument(contentResolver, directoryUri, "", fileName)
-                }
-                fileUri
-            } else {
-                "$path${File.separator}$fileName"
-            }
+            val ext = firstUrls.first().substringAfterLast(".").substringBefore("?")
+            val mimeType = if (ext.equals("mp4", true)) "video/mp4" else "video/mp2t"
+            val fileName = "${offlineVideo.channelLogin ?: ""}${offlineVideo.quality ?: ""}${downloadDate}.$ext"
+            val fileUri = SafUtils.getOrCreateDocument(contentResolver, path, fileName, mimeType)
             val initSegmentBytes = initSegmentUri?.let { url ->
                 try {
                     val bytes = downloadByteArray(networkLibrary, url)
-                    if (isShared) {
-                        contentResolver.openOutputStream(fileUri.toUri(), "wa")!!
-                    } else {
-                        FileOutputStream(fileUri, true)
-                    }.use {
+                    SafUtils.openOutputStream(contentResolver, fileUri, append = true).use {
                         it.write(bytes)
                     }
                     bytes.size.toLong()
@@ -918,11 +879,7 @@ class StreamDownloadService : LifecycleService() {
                         while (true) {
                             val data = readySegments.remove(i)
                             if (data != null) {
-                                if (isShared) {
-                                    contentResolver.openOutputStream(videoFileUri.toUri(), "wa")!!
-                                } else {
-                                    FileOutputStream(videoFileUri, true)
-                                }.use {
+                                SafUtils.openOutputStream(contentResolver, videoFileUri, append = true).use {
                                     it.write(data)
                                 }
                                 downloadProgress.bytes += data.size
@@ -1139,25 +1096,12 @@ class StreamDownloadService : LifecycleService() {
     }
 
     private suspend fun startChatJob(offlineVideo: OfflineVideo, downloadProgress: DownloadProgress, downloadJob: DownloadJob, channelLogin: String, path: String, downloadDate: Long, streamStartTime: String, networkLibrary: String?) = withContext(Dispatchers.IO) {
-        val isShared = path.toUri().scheme == ContentResolver.SCHEME_CONTENT
         val resumed = !offlineVideo.chatUrl.isNullOrBlank() && downloadProgress.chatBytes > 0
-        val fileUri = if (resumed) {
+        val fileUri = if (resumed && SafUtils.fileExists(contentResolver, offlineVideo.chatUrl!!)) {
             offlineVideo.chatUrl!!
         } else {
             val fileName = "${channelLogin}${offlineVideo.quality ?: ""}${downloadDate}_chat.json"
-            val fileUri = if (isShared) {
-                val documentId = DocumentsContract.getTreeDocumentId(path.toUri())
-                val directoryUri = DocumentsContract.buildDocumentUriUsingTree(path.toUri(), documentId)
-                val fileUri = directoryUri.toString() + (if (!directoryUri.toString().endsWith("%3A")) "%2F" else "") + fileName
-                try {
-                    contentResolver.openOutputStream(fileUri.toUri())!!.close()
-                } catch (e: IllegalArgumentException) {
-                    DocumentsContract.createDocument(contentResolver, directoryUri, "", fileName)
-                }
-                fileUri
-            } else {
-                "$path${File.separator}$fileName"
-            }
+            val fileUri = SafUtils.getOrCreateDocument(contentResolver, path, fileName, "application/json")
             xtraModule.offlineVideosRepository.update(offlineVideo.apply {
                 chatUrl = fileUri
             })
@@ -1206,7 +1150,7 @@ class StreamDownloadService : LifecycleService() {
                 add(launch(Dispatchers.IO) {
                     try {
                         val response = xtraModule.playerRepository.loadGlobalFFZEmotesResponse(networkLibrary)
-                        val emotes = xtraModule.playerRepository.loadGlobalFFZEmotes(response, useWebp)
+                        val emotes = xtraModule.playerRepository.loadFFZEmotes(response, useWebp)
                         emoteList.addAll(emotes)
                         emoteList.sortBy { it.source }
                     } catch (e: Exception) {
@@ -1280,152 +1224,121 @@ class StreamDownloadService : LifecycleService() {
         val savedBadges = mutableListOf<Pair<String, String>>()
         val savedEmotes = mutableListOf<String>()
         if (resumed) {
-            if (isShared) {
-                contentResolver.openFileDescriptor(fileUri.toUri(), "rw")?.use {
-                    FileOutputStream(it.fileDescriptor).channel.truncate(downloadProgress.chatBytes)
-                }
-            } else {
-                val file = File(fileUri)
-                if (file.exists()) {
-                    RandomAccessFile(file, "rw").use {
-                        it.setLength(downloadProgress.chatBytes)
-                    }
-                }
-            }
-            if (isShared) {
-                contentResolver.openOutputStream(fileUri.toUri(), "wa")!!.bufferedWriter()
-            } else {
-                FileOutputStream(fileUri, true).bufferedWriter()
-            }.use { writer ->
+            SafUtils.truncateFile(contentResolver, fileUri, downloadProgress.chatBytes)
+            SafUtils.openOutputStream(contentResolver, fileUri, append = true).bufferedWriter().use { writer ->
                 if (downloadProgress.liveCommentsArrayStarted) {
                     writer.write("]")
                 }
                 writer.write("}")
             }
-            if (isShared) {
-                contentResolver.openInputStream(fileUri.toUri())?.bufferedReader()
-            } else {
-                val file = File(fileUri)
-                if (file.exists()) FileInputStream(file).bufferedReader() else null
-            }?.use { fileReader ->
-                JsonReader(fileReader).use { reader ->
-                    reader.isLenient = true
-                    var token: JsonToken
-                    do {
-                        token = reader.peek()
-                        when (token) {
-                            JsonToken.END_DOCUMENT -> {}
-                            JsonToken.BEGIN_OBJECT -> {
-                                reader.beginObject()
-                                while (reader.hasNext()) {
-                                    when (reader.peek()) {
-                                        JsonToken.NAME -> {
-                                            when (reader.nextName()) {
-                                                "twitchEmotes" -> {
-                                                    reader.beginArray()
-                                                    while (reader.hasNext()) {
-                                                        reader.beginObject()
-                                                        var id: String? = null
+            try {
+                SafUtils.openInputStream(contentResolver, fileUri).bufferedReader().use { fileReader ->
+                    JsonReader(fileReader).use { reader ->
+                        reader.isLenient = true
+                        var token: JsonToken
+                        do {
+                            token = reader.peek()
+                            when (token) {
+                                JsonToken.END_DOCUMENT -> {}
+                                JsonToken.BEGIN_OBJECT -> {
+                                    reader.beginObject()
+                                    while (reader.hasNext()) {
+                                        when (reader.peek()) {
+                                            JsonToken.NAME -> {
+                                                when (reader.nextName()) {
+                                                    "twitchEmotes" -> {
+                                                        reader.beginArray()
                                                         while (reader.hasNext()) {
-                                                            when (reader.nextName()) {
-                                                                "id" -> id = reader.nextString()
-                                                                else -> reader.skipValue()
+                                                            reader.beginObject()
+                                                            var id: String? = null
+                                                            while (reader.hasNext()) {
+                                                                when (reader.nextName()) {
+                                                                    "id" -> id = reader.nextString()
+                                                                    else -> reader.skipValue()
+                                                                }
                                                             }
+                                                            if (!id.isNullOrBlank()) {
+                                                                savedTwitchEmotes.add(id)
+                                                            }
+                                                            reader.endObject()
                                                         }
-                                                        if (!id.isNullOrBlank()) {
-                                                            savedTwitchEmotes.add(id)
-                                                        }
-                                                        reader.endObject()
+                                                        reader.endArray()
                                                     }
-                                                    reader.endArray()
-                                                }
-                                                "twitchBadges" -> {
-                                                    reader.beginArray()
-                                                    while (reader.hasNext()) {
-                                                        reader.beginObject()
-                                                        var setId: String? = null
-                                                        var version: String? = null
+                                                    "twitchBadges" -> {
+                                                        reader.beginArray()
                                                         while (reader.hasNext()) {
-                                                            when (reader.nextName()) {
-                                                                "setId" -> setId = reader.nextString()
-                                                                "version" -> version = reader.nextString()
-                                                                else -> reader.skipValue()
+                                                            reader.beginObject()
+                                                            var setId: String? = null
+                                                            var version: String? = null
+                                                            while (reader.hasNext()) {
+                                                                when (reader.nextName()) {
+                                                                    "setId" -> setId = reader.nextString()
+                                                                    "version" -> version = reader.nextString()
+                                                                    else -> reader.skipValue()
+                                                                }
                                                             }
+                                                            if (!setId.isNullOrBlank() && !version.isNullOrBlank()) {
+                                                                savedBadges.add(Pair(setId, version))
+                                                            }
+                                                            reader.endObject()
                                                         }
-                                                        if (!setId.isNullOrBlank() && !version.isNullOrBlank()) {
-                                                            savedBadges.add(Pair(setId, version))
-                                                        }
-                                                        reader.endObject()
+                                                        reader.endArray()
                                                     }
-                                                    reader.endArray()
-                                                }
-                                                "cheerEmotes" -> {
-                                                    reader.beginArray()
-                                                    while (reader.hasNext()) {
-                                                        reader.beginObject()
-                                                        var name: String? = null
+                                                    "cheerEmotes" -> {
+                                                        reader.beginArray()
                                                         while (reader.hasNext()) {
-                                                            when (reader.nextName()) {
-                                                                "name" -> name = reader.nextString()
-                                                                else -> reader.skipValue()
+                                                            reader.beginObject()
+                                                            var name: String? = null
+                                                            while (reader.hasNext()) {
+                                                                when (reader.nextName()) {
+                                                                    "name" -> name = reader.nextString()
+                                                                    else -> reader.skipValue()
+                                                                }
                                                             }
+                                                            if (!name.isNullOrBlank()) {
+                                                                savedEmotes.add(name)
+                                                            }
+                                                            reader.endObject()
                                                         }
-                                                        if (!name.isNullOrBlank()) {
-                                                            savedEmotes.add(name)
-                                                        }
-                                                        reader.endObject()
+                                                        reader.endArray()
                                                     }
-                                                    reader.endArray()
-                                                }
-                                                "emotes" -> {
-                                                    reader.beginArray()
-                                                    while (reader.hasNext()) {
-                                                        reader.beginObject()
-                                                        var name: String? = null
+                                                    "emotes" -> {
+                                                        reader.beginArray()
                                                         while (reader.hasNext()) {
-                                                            when (reader.nextName()) {
-                                                                "name" -> name = reader.nextString()
-                                                                else -> reader.skipValue()
+                                                            reader.beginObject()
+                                                            var name: String? = null
+                                                            while (reader.hasNext()) {
+                                                                when (reader.nextName()) {
+                                                                    "name" -> name = reader.nextString()
+                                                                    else -> reader.skipValue()
+                                                                }
                                                             }
+                                                            if (!name.isNullOrBlank()) {
+                                                                savedEmotes.add(name)
+                                                            }
+                                                            reader.endObject()
                                                         }
-                                                        if (!name.isNullOrBlank()) {
-                                                            savedEmotes.add(name)
-                                                        }
-                                                        reader.endObject()
+                                                        reader.endArray()
                                                     }
-                                                    reader.endArray()
+                                                    else -> reader.skipValue()
                                                 }
-                                                else -> reader.skipValue()
                                             }
+                                            else -> reader.skipValue()
                                         }
-                                        else -> reader.skipValue()
                                     }
+                                    reader.endObject()
                                 }
-                                reader.endObject()
+                                else -> reader.skipValue()
                             }
-                            else -> reader.skipValue()
-                        }
-                    } while (token != JsonToken.END_DOCUMENT)
-                }
-            }
-            if (isShared) {
-                contentResolver.openFileDescriptor(fileUri.toUri(), "rw")?.use {
-                    FileOutputStream(it.fileDescriptor).channel.truncate(downloadProgress.chatBytes)
-                }
-            } else {
-                val file = File(fileUri)
-                if (file.exists()) {
-                    RandomAccessFile(file, "rw").use {
-                        it.setLength(downloadProgress.chatBytes)
+                        } while (token != JsonToken.END_DOCUMENT)
                     }
                 }
+            } catch (e: Exception) {
+                Log.w("StreamDownloadService", "Error reading existing stream chat", e)
             }
+            SafUtils.truncateFile(contentResolver, fileUri, downloadProgress.chatBytes)
         } else {
-            if (isShared) {
-                contentResolver.openOutputStream(fileUri.toUri())!!.bufferedWriter()
-            } else {
-                FileOutputStream(fileUri).bufferedWriter()
-            }.use { writer ->
+            SafUtils.openOutputStream(contentResolver, fileUri, append = false).bufferedWriter().use { writer ->
                 writer.write("{".also { position += 1 })
                 writer.write("\"video\":".also { position += it.length })
                 writer.write(
@@ -1450,32 +1363,28 @@ class StreamDownloadService : LifecycleService() {
             trustManager = xtraModule.trustManager,
             listener = object : ChatReadWebSocket.Listener {
                 override suspend fun onChatMessage(message: ChatUtils.IRCMessage, userNotice: Boolean) {
-                    saveMessage(offlineVideo, downloadProgress, message, isShared, fileUri, downloadEmotes, networkLibrary, emoteQuality, savedTwitchEmotes, savedBadges, savedEmotes, globalBadgeList, channelBadgeList, cheerEmoteList, emoteList)
+                    saveMessage(offlineVideo, downloadProgress, message, fileUri, downloadEmotes, networkLibrary, emoteQuality, savedTwitchEmotes, savedBadges, savedEmotes, globalBadgeList, channelBadgeList, cheerEmoteList, emoteList)
                 }
 
                 override suspend fun onClearMessage(message: ChatUtils.IRCMessage) {
-                    saveMessage(offlineVideo, downloadProgress, message, isShared, fileUri, downloadEmotes, networkLibrary, emoteQuality, savedTwitchEmotes, savedBadges, savedEmotes, globalBadgeList, channelBadgeList, cheerEmoteList, emoteList)
+                    saveMessage(offlineVideo, downloadProgress, message, fileUri, downloadEmotes, networkLibrary, emoteQuality, savedTwitchEmotes, savedBadges, savedEmotes, globalBadgeList, channelBadgeList, cheerEmoteList, emoteList)
                 }
 
                 override suspend fun onClearChat(message: ChatUtils.IRCMessage) {
-                    saveMessage(offlineVideo, downloadProgress, message, isShared, fileUri, downloadEmotes, networkLibrary, emoteQuality, savedTwitchEmotes, savedBadges, savedEmotes, globalBadgeList, channelBadgeList, cheerEmoteList, emoteList)
+                    saveMessage(offlineVideo, downloadProgress, message, fileUri, downloadEmotes, networkLibrary, emoteQuality, savedTwitchEmotes, savedBadges, savedEmotes, globalBadgeList, channelBadgeList, cheerEmoteList, emoteList)
                 }
 
                 override suspend fun onNotice(message: ChatUtils.IRCMessage) {
-                    saveMessage(offlineVideo, downloadProgress, message, isShared, fileUri, downloadEmotes, networkLibrary, emoteQuality, savedTwitchEmotes, savedBadges, savedEmotes, globalBadgeList, channelBadgeList, cheerEmoteList, emoteList)
+                    saveMessage(offlineVideo, downloadProgress, message, fileUri, downloadEmotes, networkLibrary, emoteQuality, savedTwitchEmotes, savedBadges, savedEmotes, globalBadgeList, channelBadgeList, cheerEmoteList, emoteList)
                 }
             }
         ).apply { connect(this@withContext) }
     }
 
-    private suspend fun saveMessage(offlineVideo: OfflineVideo, downloadProgress: DownloadProgress, message: ChatUtils.IRCMessage, isShared: Boolean, fileUri: String, downloadEmotes: Boolean, networkLibrary: String?, emoteQuality: String, savedTwitchEmotes: MutableList<String>, savedBadges: MutableList<Pair<String, String>>, savedEmotes: MutableList<String>, globalBadgeList: List<TwitchBadge>, channelBadgeList: List<TwitchBadge>, cheerEmoteList: List<CheerEmote>, emoteList: List<Emote>) = withContext(Dispatchers.IO) {
+    private suspend fun saveMessage(offlineVideo: OfflineVideo, downloadProgress: DownloadProgress, message: ChatUtils.IRCMessage, fileUri: String, downloadEmotes: Boolean, networkLibrary: String?, emoteQuality: String, savedTwitchEmotes: MutableList<String>, savedBadges: MutableList<Pair<String, String>>, savedEmotes: MutableList<String>, globalBadgeList: List<TwitchBadge>, channelBadgeList: List<TwitchBadge>, cheerEmoteList: List<CheerEmote>, emoteList: List<Emote>) = withContext(Dispatchers.IO) {
         var position = downloadProgress.chatBytes
         var liveCommentsArrayStarted = downloadProgress.liveCommentsArrayStarted
-        if (isShared) {
-            contentResolver.openOutputStream(fileUri.toUri(), "wa")!!.bufferedWriter()
-        } else {
-            FileOutputStream(fileUri, true).bufferedWriter()
-        }.use { writer ->
+        SafUtils.openOutputStream(contentResolver, fileUri, append = true).bufferedWriter().use { writer ->
             writer.write(",".also { position += 1 })
             if (!liveCommentsArrayStarted) {
                 liveCommentsArrayStarted = true
@@ -1536,11 +1445,7 @@ class StreamDownloadService : LifecycleService() {
                     }
                 }
                 if (twitchEmotes.isNotEmpty() || twitchBadges.isNotEmpty() || cheerEmotes.isNotEmpty() || emotes.isNotEmpty()) {
-                    if (isShared) {
-                        contentResolver.openOutputStream(fileUri.toUri(), "wa")!!.bufferedWriter()
-                    } else {
-                        FileOutputStream(fileUri, true).bufferedWriter()
-                    }.use { writer ->
+                    SafUtils.openOutputStream(contentResolver, fileUri, append = true).bufferedWriter().use { writer ->
                         writer.write("]".also { position += 1 })
                     }
                     liveCommentsArrayStarted = false
@@ -1576,11 +1481,7 @@ class StreamDownloadService : LifecycleService() {
                         }.awaitAll().filterNotNull()
 
                         if (downloaded.isNotEmpty()) {
-                            if (isShared) {
-                                contentResolver.openOutputStream(fileUri.toUri(), "wa")!!.bufferedWriter()
-                            } else {
-                                FileOutputStream(fileUri, true).bufferedWriter()
-                            }.use { writer ->
+                            SafUtils.openOutputStream(contentResolver, fileUri, append = true).bufferedWriter().use { writer ->
                                 writer.write(",\"twitchEmotes\":[".also { position += it.length })
                                 downloaded.forEachIndexed { index, item ->
                                     if (index > 0) writer.write(",".also { position += 1 })
@@ -1622,11 +1523,7 @@ class StreamDownloadService : LifecycleService() {
                         }.awaitAll().filterNotNull()
 
                         if (downloaded.isNotEmpty()) {
-                            if (isShared) {
-                                contentResolver.openOutputStream(fileUri.toUri(), "wa")!!.bufferedWriter()
-                            } else {
-                                FileOutputStream(fileUri, true).bufferedWriter()
-                            }.use { writer ->
+                            SafUtils.openOutputStream(contentResolver, fileUri, append = true).bufferedWriter().use { writer ->
                                 writer.write(",\"twitchBadges\":[".also { position += it.length })
                                 downloaded.forEachIndexed { index, item ->
                                     if (index > 0) writer.write(",".also { position += 1 })
@@ -1669,11 +1566,7 @@ class StreamDownloadService : LifecycleService() {
                         }.awaitAll().filterNotNull()
 
                         if (downloaded.isNotEmpty()) {
-                            if (isShared) {
-                                contentResolver.openOutputStream(fileUri.toUri(), "wa")!!.bufferedWriter()
-                            } else {
-                                FileOutputStream(fileUri, true).bufferedWriter()
-                            }.use { writer ->
+                            SafUtils.openOutputStream(contentResolver, fileUri, append = true).bufferedWriter().use { writer ->
                                 writer.write(",\"cheerEmotes\":[".also { position += it.length })
                                 downloaded.forEachIndexed { index, item ->
                                     if (index > 0) writer.write(",".also { position += 1 })
@@ -1715,11 +1608,7 @@ class StreamDownloadService : LifecycleService() {
                         }.awaitAll().filterNotNull()
 
                         if (downloaded.isNotEmpty()) {
-                            if (isShared) {
-                                contentResolver.openOutputStream(fileUri.toUri(), "wa")!!.bufferedWriter()
-                            } else {
-                                FileOutputStream(fileUri, true).bufferedWriter()
-                            }.use { writer ->
+                            SafUtils.openOutputStream(contentResolver, fileUri, append = true).bufferedWriter().use { writer ->
                                 writer.write(",\"emotes\":[".also { position += it.length })
                                 downloaded.forEachIndexed { index, item ->
                                     if (index > 0) writer.write(",".also { position += 1 })

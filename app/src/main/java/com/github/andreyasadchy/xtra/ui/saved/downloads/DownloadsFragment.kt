@@ -41,6 +41,7 @@ import com.github.andreyasadchy.xtra.model.ui.DownloadProgress
 import com.github.andreyasadchy.xtra.model.ui.OfflineVideo
 import com.github.andreyasadchy.xtra.ui.common.PagedListFragment
 import com.github.andreyasadchy.xtra.ui.common.Scrollable
+import com.github.andreyasadchy.xtra.ui.download.DownloadRetryWorker
 import com.github.andreyasadchy.xtra.ui.download.StreamDownloadService
 import com.github.andreyasadchy.xtra.ui.download.VideoDownloadService
 import com.github.andreyasadchy.xtra.ui.saved.downloads.DownloadsViewModel.Companion.DownloadsViewModelFactory
@@ -351,6 +352,9 @@ class DownloadsFragment : PagedListFragment(), Scrollable {
                         }
                     }
                 }
+                if (autoRetry) {
+                    DownloadRetryWorker.enqueueRetry(requireContext(), 1L)
+                }
                 if (activeDownloads.any { it.live }) {
                     bindStreamDownloadService(true)
                 }
@@ -409,7 +413,6 @@ class DownloadsFragment : PagedListFragment(), Scrollable {
                         } else {
                             videoDownloadServiceConnection?.let { requireContext().unbindService(it) }
                             videoDownloadServiceConnection = null
-                            videoDownloadService?.stopSelf()
                             videoDownloadService = null
                         }
                     }
@@ -434,7 +437,6 @@ class DownloadsFragment : PagedListFragment(), Scrollable {
                     streamDownloadService?.listener = null
                     streamDownloadServiceConnection?.let { requireContext().unbindService(it) }
                     streamDownloadServiceConnection = null
-                    streamDownloadService?.stopSelf()
                     streamDownloadService = null
                 }
             }
