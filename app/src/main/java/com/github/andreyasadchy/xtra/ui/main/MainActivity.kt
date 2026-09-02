@@ -237,6 +237,37 @@ class MainActivity : AppCompatActivity() {
                                         tokenPrefs().getLong(C.UPDATE_LAST_CHECKED, 0)
                                     )
                                 }
+                                val wifiOnly = prefs.getBoolean(C.DOWNLOAD_WIFI_ONLY, false)
+                                val cellular = networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
+                                if (!wifiOnly || !cellular) {
+                                    val downloads = viewModel.getWaitingDownloads()
+                                    if (downloads.isNotEmpty()) {
+                                        downloads.forEach {
+                                            val intent = if (it.live) {
+                                                Intent(this@MainActivity, StreamDownloadService::class.java).apply {
+                                                    action = StreamDownloadService.INTENT_START
+                                                    putExtra(StreamDownloadService.KEY_VIDEO_ID, it.id)
+                                                }
+                                            } else {
+                                                Intent(this@MainActivity, VideoDownloadService::class.java).apply {
+                                                    action = VideoDownloadService.INTENT_START
+                                                    putExtra(VideoDownloadService.KEY_VIDEO_ID, it.id)
+                                                }
+                                            }
+                                            startService(intent)
+                                        }
+                                        val currentFragment = supportFragmentManager.findFragmentById(R.id.navHostFragment)?.childFragmentManager?.fragments?.getOrNull(0)
+                                        if (currentFragment is SavedPagerFragment || currentFragment is SavedMediaFragment) {
+                                            val fragment = currentFragment.childFragmentManager.fragments.find { it is DownloadsFragment }
+                                            if (downloads.any { it.live }) {
+                                                (fragment as? DownloadsFragment)?.bindStreamDownloadService(true)
+                                            }
+                                            if (downloads.any { !it.live }) {
+                                                (fragment as? DownloadsFragment)?.bindVideoDownloadService(true)
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         viewModel.checkNetworkStatus.value = false

@@ -129,6 +129,8 @@ dependencies {
     implementation(libs.glide.webpdecoder)
 
     implementation(libs.coroutines)
+
+    testImplementation("junit:junit:4.13.2")
 }
 
 apollo {

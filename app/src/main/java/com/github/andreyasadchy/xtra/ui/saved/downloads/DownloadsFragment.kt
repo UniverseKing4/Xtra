@@ -315,11 +315,47 @@ class DownloadsFragment : PagedListFragment(), Scrollable {
         viewLifecycleOwner.lifecycleScope.launch {
             val activeDownloads = viewModel.getActiveDownloads()
             if (activeDownloads.isNotEmpty()) {
+                val autoRetry = requireContext().prefs().getBoolean(C.DOWNLOAD_AUTO_RETRY, true)
+                val isWifiOnly = requireContext().prefs().getBoolean(C.DOWNLOAD_WIFI_ONLY, false)
+                val connectivityManager = requireContext().getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                val networkCapabilities = connectivityManager.getNetworkCapabilities(connectivityManager.activeNetwork)
+                val isCellular = networkCapabilities != null && networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
+                val canDownload = !isWifiOnly || !isCellular
+
+                for (video in activeDownloads) {
+                    if (video.live) {
+                        val isServiceActive = streamDownloadService?.activeDownloads?.any { it.id == video.id } == true
+                        if (!isServiceActive) {
+                            if (autoRetry && canDownload) {
+                                val intent = Intent(requireContext(), StreamDownloadService::class.java).apply {
+                                    action = StreamDownloadService.INTENT_START
+                                    putExtra(StreamDownloadService.KEY_VIDEO_ID, video.id)
+                                }
+                                requireContext().startService(intent)
+                            } else {
+                                viewModel.updateDownloadStatus(video, isWifiOnly && isCellular)
+                            }
+                        }
+                    } else {
+                        val isServiceActive = videoDownloadService?.activeDownloads?.any { it.id == video.id } == true
+                        if (!isServiceActive) {
+                            if (autoRetry && canDownload) {
+                                val intent = Intent(requireContext(), VideoDownloadService::class.java).apply {
+                                    action = VideoDownloadService.INTENT_START
+                                    putExtra(VideoDownloadService.KEY_VIDEO_ID, video.id)
+                                }
+                                requireContext().startService(intent)
+                            } else {
+                                viewModel.updateDownloadStatus(video, isWifiOnly && isCellular)
+                            }
+                        }
+                    }
+                }
                 if (activeDownloads.any { it.live }) {
-                    bindStreamDownloadService()
+                    bindStreamDownloadService(true)
                 }
                 if (activeDownloads.any { !it.live }) {
-                    bindVideoDownloadService()
+                    bindVideoDownloadService(true)
                 }
             }
         }

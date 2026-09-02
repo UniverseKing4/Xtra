@@ -12,7 +12,7 @@ import kotlinx.parcelize.Parcelize
 class OfflineVideo(
     var url: String? = null,
     @ColumnInfo(name = "source_url")
-    val sourceUrl: String? = null,
+    var sourceUrl: String? = null,
     @ColumnInfo(name = "source_start_position")
     var sourceStartPosition: Long? = null,
     var name: String? = null,

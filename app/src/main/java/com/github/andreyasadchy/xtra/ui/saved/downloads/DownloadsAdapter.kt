@@ -131,22 +131,43 @@ class DownloadsAdapter(
                     OfflineVideo.STATUS_DOWNLOADING -> {
                         if (item.live || progress == null) {
                             context.getString(R.string.downloading)
+                        } else if (item.quality == "chat_only") {
+                            val percent = if (progress.maxChatProgress > 0) {
+                                ((progress.chatProgress.toFloat() / progress.maxChatProgress) * 100f).toInt().coerceIn(0, 100)
+                            } else 0
+                            context.getString(R.string.chat_downloading_progress, percent)
                         } else {
-                            context.getString(R.string.downloading_progress, ((progress.progress.toFloat() / progress.maxProgress) * 100f).toInt())
+                            val percent = if (progress.maxProgress > 0) {
+                                ((progress.progress.toFloat() / progress.maxProgress) * 100f).toInt().coerceIn(0, 100)
+                            } else 0
+                            context.getString(R.string.downloading_progress, percent)
                         }
                     }
-                    OfflineVideo.STATUS_MOVING -> context.getString(R.string.download_moving, ((item.progress.toFloat() / item.maxProgress) * 100f).toInt())
-                    OfflineVideo.STATUS_DELETING -> context.getString(R.string.download_deleting, ((item.progress.toFloat() / item.maxProgress) * 100f).toInt())
-                    OfflineVideo.STATUS_CONVERTING -> context.getString(R.string.download_converting, ((item.progress.toFloat() / item.maxProgress) * 100f).toInt())
+                    OfflineVideo.STATUS_MOVING -> context.getString(R.string.download_moving, if (item.maxProgress > 0) ((item.progress.toFloat() / item.maxProgress) * 100f).toInt().coerceIn(0, 100) else 0)
+                    OfflineVideo.STATUS_DELETING -> context.getString(R.string.download_deleting, if (item.maxProgress > 0) ((item.progress.toFloat() / item.maxProgress) * 100f).toInt().coerceIn(0, 100) else 0)
+                    OfflineVideo.STATUS_CONVERTING -> context.getString(R.string.download_converting, if (item.maxProgress > 0) ((item.progress.toFloat() / item.maxProgress) * 100f).toInt().coerceIn(0, 100) else 0)
                     OfflineVideo.STATUS_QUEUED -> context.getString(R.string.download_queued)
                     OfflineVideo.STATUS_WAITING_FOR_NETWORK -> context.getString(R.string.download_blocked)
                     OfflineVideo.STATUS_WAITING_FOR_WIFI -> context.getString(R.string.download_blocked_wifi)
                     OfflineVideo.STATUS_WAITING_FOR_STREAM -> context.getString(R.string.download_waiting_for_stream)
-                    else -> context.getString(R.string.download_pending)
+                    else -> {
+                        if (item.quality == "chat_only" && item.maxChatProgress > 0 && item.chatProgress > 0) {
+                            val percent = ((item.chatProgress.toFloat() / item.maxChatProgress) * 100f).toInt().coerceIn(0, 100)
+                            "${context.getString(R.string.download_pending)} ($percent%)"
+                        } else if (item.maxProgress > 0 && item.progress > 0) {
+                            val percent = ((item.progress.toFloat() / item.maxProgress) * 100f).toInt().coerceIn(0, 100)
+                            "${context.getString(R.string.download_pending)} ($percent%)"
+                        } else {
+                            context.getString(R.string.download_pending)
+                        }
+                    }
                 }
-                if (item.downloadChat && itemStatus == OfflineVideo.STATUS_DOWNLOADING && progress != null && !item.live) {
+                if (item.downloadChat && item.quality != "chat_only" && itemStatus == OfflineVideo.STATUS_DOWNLOADING && progress != null && !item.live) {
                     chatDownloadProgress.visibility = View.VISIBLE
-                    chatDownloadProgress.text = context.getString(R.string.chat_downloading_progress, min(((progress.chatProgress.toFloat() / progress.maxChatProgress) * 100f).toInt(), 100))
+                    val chatPercent = if (progress.maxChatProgress > 0) {
+                        ((progress.chatProgress.toFloat() / progress.maxChatProgress) * 100f).toInt().coerceIn(0, 100)
+                    } else 0
+                    chatDownloadProgress.text = context.getString(R.string.chat_downloading_progress, chatPercent)
                 } else {
                     chatDownloadProgress.visibility = View.GONE
                 }
