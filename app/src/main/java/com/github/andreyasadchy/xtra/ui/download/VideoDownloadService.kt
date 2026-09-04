@@ -46,12 +46,15 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -60,9 +63,11 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import okhttp3.Request
+import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -71,6 +76,7 @@ import java.io.OutputStream
 import java.io.RandomAccessFile
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.cancellation.CancellationException
 
 class VideoDownloadService : LifecycleService() {
@@ -447,6 +453,68 @@ class VideoDownloadService : LifecycleService() {
         }
     }
 
+    private suspend fun downloadSegmentBytes(
+        networkLibrary: String?,
+        segmentUrl: String
+    ): ByteArray {
+        var segmentBytes: ByteArray? = null
+        var segmentRetries = 3
+        var lastException: Exception? = null
+
+        while (segmentBytes == null && segmentRetries > 0) {
+            kotlin.coroutines.coroutineContext.ensureActive()
+            try {
+                segmentBytes = withTimeoutOrNull(SEGMENT_TIMEOUT_MS) {
+                    downloadByteArray(networkLibrary, segmentUrl)
+                }
+                if (segmentBytes == null) {
+                    throw IOException("Segment download timed out after ${SEGMENT_TIMEOUT_MS}ms: $segmentUrl")
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                lastException = e
+                segmentRetries--
+                if (segmentRetries > 0) {
+                    delay(1000L)
+                }
+            }
+        }
+
+        if (segmentBytes != null) {
+            return segmentBytes
+        }
+
+        val fallbackUrls = mutableListOf<String>()
+        if (segmentUrl.contains("-muted")) {
+            fallbackUrls.add(segmentUrl.replace("-muted", "-unmuted"))
+            fallbackUrls.add(segmentUrl.replace("-muted", ""))
+        } else if (segmentUrl.contains("-unmuted")) {
+            fallbackUrls.add(segmentUrl.replace("-unmuted", "-muted"))
+            fallbackUrls.add(segmentUrl.replace("-unmuted", ""))
+        } else if (segmentUrl.contains(".ts")) {
+            fallbackUrls.add(segmentUrl.replace(".ts", "-muted.ts"))
+        }
+
+        for (fallbackUrl in fallbackUrls) {
+            kotlin.coroutines.coroutineContext.ensureActive()
+            try {
+                val bytes = withTimeoutOrNull(SEGMENT_TIMEOUT_MS) {
+                    downloadByteArray(networkLibrary, fallbackUrl)
+                }
+                if (bytes != null) {
+                    return bytes
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // Try next fallback
+            }
+        }
+
+        throw lastException ?: IOException("Failed to download segment: $segmentUrl")
+    }
+
     private suspend fun downloadVideo(offlineVideo: OfflineVideo, downloadProgress: DownloadProgress, sourceUrl: String) = withContext(Dispatchers.IO) {
         val networkLibrary = prefs().getString(C.NETWORK_LIBRARY, C.OKHTTP)
         val path = offlineVideo.downloadPath!!
@@ -479,13 +547,15 @@ class VideoDownloadService : LifecycleService() {
                 }
             }
         }
-        if (offlineVideo.duration == null) {
+        if (offlineVideo.duration == null || downloadProgress.maxProgress != segments.size) {
             xtraModule.offlineVideosRepository.update(offlineVideo.apply {
-                duration = downloadDuration
-                sourceStartPosition = startPosition
+                if (duration == null) {
+                    duration = downloadDuration
+                    sourceStartPosition = startPosition
+                }
                 maxProgress = segments.size
             })
-            downloadProgress.maxProgress = offlineVideo.maxProgress
+            downloadProgress.maxProgress = segments.size
         }
         val urlPath = sourceUrl.substringBeforeLast('/') + "/"
         if (offlineVideo.playlistToFile) {
@@ -504,12 +574,16 @@ class VideoDownloadService : LifecycleService() {
         playlist: MediaPlaylist,
         segments: List<Segment>
     ) = withContext(Dispatchers.IO) {
+        val ext = segments.firstOrNull()?.uri?.substringBefore('?') ?: ""
+        val fileExtension = if (ext.contains('.')) ext.substringAfterLast('.') else "ts"
         val videoFileUri = if (!offlineVideo.url.isNullOrBlank() && SafUtils.fileExists(contentResolver, offlineVideo.url!!)) {
             val fileUri = offlineVideo.url!!
-            SafUtils.truncateFile(contentResolver, fileUri, downloadProgress.bytes)
+            if (downloadProgress.bytes > 0L || downloadProgress.progress == 0) {
+                SafUtils.truncateFile(contentResolver, fileUri, downloadProgress.bytes)
+            }
             fileUri
         } else {
-            val fileName = "${offlineVideo.videoId ?: ""}${offlineVideo.quality ?: ""}${offlineVideo.downloadDate}.${segments.firstOrNull()?.uri?.substringAfterLast(".") ?: "ts"}"
+            val fileName = "${offlineVideo.videoId ?: ""}${offlineVideo.quality ?: ""}${offlineVideo.downloadDate}.$fileExtension"
             val fileUri = SafUtils.getOrCreateDocument(contentResolver, path, fileName, "video/mp2t")
             var initSegmentBytes: Long? = null
             if (playlist.initSegmentUri != null) {
@@ -518,7 +592,7 @@ class VideoDownloadService : LifecycleService() {
                 } else {
                     urlPath + playlist.initSegmentUri
                 }
-                val initData = downloadByteArray(networkLibrary, initUrl)
+                val initData = downloadSegmentBytes(networkLibrary, initUrl)
                 SafUtils.openOutputStream(contentResolver, fileUri, append = true).use {
                     it.write(initData)
                 }
@@ -534,6 +608,8 @@ class VideoDownloadService : LifecycleService() {
             fileUri
         }
 
+        val startProgress = downloadProgress.progress.coerceIn(0, segments.size)
+        downloadProgress.progress = startProgress
         downloadProgress.lastSaved = System.currentTimeMillis()
 
         coroutineScope {
@@ -550,102 +626,121 @@ class VideoDownloadService : LifecycleService() {
                 }
             }
 
-            val requestSemaphore = Semaphore(prefs().getInt(C.DOWNLOAD_CONCURRENT_LIMIT, 10))
+            val concurrentLimit = prefs().getInt(C.DOWNLOAD_CONCURRENT_LIMIT, 10).coerceIn(1, 16)
+            val maxBufferAhead = (concurrentLimit * 2).coerceIn(6, 24)
+
+            val nextDownloadIndex = AtomicInteger(startProgress)
+            val writeIndexFlow = MutableStateFlow(startProgress)
             val readySegments = ConcurrentHashMap<Int, ByteArray>()
             val segmentAvailableChannel = Channel<Unit>(Channel.CONFLATED)
 
             val writerJob = launch(Dispatchers.IO) {
-                var nextIndex = downloadProgress.progress
-                while (nextIndex < segments.size) {
-                    val bytes = readySegments.remove(nextIndex)
-                    if (bytes != null) {
-                        SafUtils.openOutputStream(contentResolver, videoFileUri, append = true).use {
-                            it.write(bytes)
-                        }
-                        downloadProgress.bytes += bytes.size
-                        downloadProgress.progress += 1
-                        listener?.update(downloadProgress)
-                        sendNotification(offlineVideo, downloadProgress)
+                var nextIndex = startProgress
+                var lastNotificationTime = 0L
+                val rawOut = SafUtils.openOutputStream(contentResolver, videoFileUri, append = true)
+                val bufferedOut = BufferedOutputStream(rawOut, 64 * 1024)
+                bufferedOut.use { out ->
+                    try {
+                        while (nextIndex < segments.size) {
+                            val bytes = readySegments.remove(nextIndex)
+                            if (bytes != null) {
+                                out.write(bytes)
+                                downloadProgress.bytes += bytes.size
+                                downloadProgress.progress = nextIndex + 1
+                                nextIndex++
+                                writeIndexFlow.value = nextIndex
 
-                        val currentTime = System.currentTimeMillis()
-                        if (currentTime - downloadProgress.lastSaved >= 5000L) {
-                            downloadProgress.lastSaved = currentTime
-                            xtraModule.offlineVideosRepository.update(offlineVideo.apply {
-                                progress = downloadProgress.progress
-                                maxProgress = downloadProgress.maxProgress
-                                this.bytes = downloadProgress.bytes
-                                chatProgress = downloadProgress.chatProgress
-                                maxChatProgress = downloadProgress.maxChatProgress
-                                chatBytes = downloadProgress.chatBytes
-                                chatOffsetSeconds = downloadProgress.chatOffsetSeconds
-                            })
+                                val currentTime = System.currentTimeMillis()
+                                if (currentTime - lastNotificationTime >= 1000L || nextIndex == segments.size) {
+                                    lastNotificationTime = currentTime
+                                    listener?.update(downloadProgress)
+                                    sendNotification(offlineVideo, downloadProgress)
+                                }
+
+                                if (currentTime - downloadProgress.lastSaved >= 5000L) {
+                                    downloadProgress.lastSaved = currentTime
+                                    out.flush()
+                                    try {
+                                        xtraModule.offlineVideosRepository.update(offlineVideo.apply {
+                                            progress = downloadProgress.progress
+                                            maxProgress = downloadProgress.maxProgress
+                                            this.bytes = downloadProgress.bytes
+                                            chatProgress = downloadProgress.chatProgress
+                                            maxChatProgress = downloadProgress.maxChatProgress
+                                            chatBytes = downloadProgress.chatBytes
+                                            chatOffsetSeconds = downloadProgress.chatOffsetSeconds
+                                        })
+                                    } catch (e: Exception) {
+                                        Log.w("VideoDownloadService", "Error updating offline video progress", e)
+                                    }
+                                }
+                            } else {
+                                segmentAvailableChannel.receive()
+                            }
                         }
-                        nextIndex++
-                    } else {
-                        segmentAvailableChannel.receive()
+                        out.flush()
+                    } finally {
+                        withContext(NonCancellable) {
+                            try {
+                                while (nextIndex < segments.size) {
+                                    val bytes = readySegments.remove(nextIndex) ?: break
+                                    out.write(bytes)
+                                    downloadProgress.bytes += bytes.size
+                                    downloadProgress.progress = nextIndex + 1
+                                    nextIndex++
+                                }
+                                out.flush()
+                            } catch (e: Exception) {
+                                Log.w("VideoDownloadService", "Error flushing remaining segments on exit", e)
+                            }
+                            readySegments.clear()
+                            downloadProgress.lastSaved = System.currentTimeMillis()
+                            try {
+                                xtraModule.offlineVideosRepository.update(offlineVideo.apply {
+                                    progress = downloadProgress.progress
+                                    maxProgress = downloadProgress.maxProgress
+                                    this.bytes = downloadProgress.bytes
+                                    chatProgress = downloadProgress.chatProgress
+                                    maxChatProgress = downloadProgress.maxChatProgress
+                                    chatBytes = downloadProgress.chatBytes
+                                    chatOffsetSeconds = downloadProgress.chatOffsetSeconds
+                                })
+                            } catch (e: Exception) {
+                                Log.w("VideoDownloadService", "Error saving progress in finally", e)
+                            }
+                        }
                     }
                 }
             }
 
-            val downloadJobs = (downloadProgress.progress until segments.size).map { index ->
-                val segment = segments[index]
+            val downloadWorkers = List(concurrentLimit) {
                 launch(Dispatchers.IO) {
-                    requestSemaphore.acquire()
-                    try {
+                    while (isActive) {
+                        val index = nextDownloadIndex.getAndUpdate { curr ->
+                            if (curr < segments.size) curr + 1 else curr
+                        }
+                        if (index >= segments.size) {
+                            break
+                        }
+
+                        // Flow control: wait until this segment is within the sliding window
+                        writeIndexFlow.first { writeIndex -> index < writeIndex + maxBufferAhead }
+
+                        val segment = segments[index]
                         val segmentUrl = if (segment.uri.startsWith("http://") || segment.uri.startsWith("https://")) {
                             segment.uri
                         } else {
                             urlPath + segment.uri
                         }
-                        var segmentBytes: ByteArray? = null
-                        var segmentRetries = 3
-                        while (segmentBytes == null && segmentRetries > 0) {
-                            try {
-                                segmentBytes = downloadByteArray(networkLibrary, segmentUrl)
-                            } catch (e: CancellationException) {
-                                throw e
-                            } catch (e: Exception) {
-                                segmentRetries--
-                                if (segmentRetries > 0) {
-                                    delay(1000L)
-                                } else {
-                                    if (segmentUrl.contains("-muted")) {
-                                        try {
-                                            segmentBytes = downloadByteArray(networkLibrary, segmentUrl.replace("-muted", "-unmuted"))
-                                        } catch (e2: Exception) {
-                                            try {
-                                                segmentBytes = downloadByteArray(networkLibrary, segmentUrl.replace("-muted", ""))
-                                            } catch (e3: Exception) {
-                                                throw e
-                                            }
-                                        }
-                                    } else if (segmentUrl.contains("-unmuted")) {
-                                        try {
-                                            segmentBytes = downloadByteArray(networkLibrary, segmentUrl.replace("-unmuted", "-muted"))
-                                        } catch (e2: Exception) {
-                                            try {
-                                                segmentBytes = downloadByteArray(networkLibrary, segmentUrl.replace("-unmuted", ""))
-                                            } catch (e3: Exception) {
-                                                throw e
-                                            }
-                                        }
-                                    } else {
-                                        throw e
-                                    }
-                                }
-                            }
-                        }
-                        if (segmentBytes != null) {
-                            readySegments[index] = segmentBytes
-                            segmentAvailableChannel.trySend(Unit)
-                        }
-                    } finally {
-                        requestSemaphore.release()
+
+                        val segmentBytes = downloadSegmentBytes(networkLibrary, segmentUrl)
+                        readySegments[index] = segmentBytes
+                        segmentAvailableChannel.trySend(Unit)
                     }
                 }
             }
 
-            downloadJobs.joinAll()
+            downloadWorkers.joinAll()
             segmentAvailableChannel.trySend(Unit)
             writerJob.join()
             chatJob?.join()
@@ -688,43 +783,21 @@ class VideoDownloadService : LifecycleService() {
                 } else {
                     urlPath + playlist.initSegmentUri
                 }
-                val initData = downloadByteArray(networkLibrary, initUrl)
+                val initData = downloadSegmentBytes(networkLibrary, initUrl)
                 SafUtils.openOutputStream(contentResolver, initSegmentFileUri, append = false).use {
                     it.write(initData)
                 }
+                downloadProgress.bytes += initData.size.toLong()
             }
             xtraModule.offlineVideosRepository.update(offlineVideo.apply {
                 url = pFileUri
+                bytes = downloadProgress.bytes
             })
             pFileUri
         }
-        val downloadedSegments = mutableListOf<String>()
-        if (SafUtils.isContentUri(path)) {
-            val playlists = xtraModule.offlineVideosRepository.getPlaylists().mapNotNull { video ->
-                video.url?.takeIf {
-                    SafUtils.isContentUri(it)
-                            && it.substringBeforeLast("%2F") == videoDirectoryUri
-                            && it != playlistFileUri
-                }
-            }
-            playlists.forEach { uri ->
-                try {
-                    val p = SafUtils.openInputStream(contentResolver, uri).use {
-                        PlaylistUtils.parseMediaPlaylist(it)
-                    }
-                    p.segments.forEach { downloadedSegments.add(it.uri.substringAfterLast("%2F").substringAfterLast("/")) }
-                } catch (e: Exception) {
 
-                }
-            }
-        } else {
-            val playlists = File(videoDirectoryUri).listFiles { it.extension == "m3u8" && it.path != playlistFileUri }
-            playlists?.forEach { file ->
-                val p = PlaylistUtils.parseMediaPlaylist(file.inputStream())
-                p.segments.forEach { downloadedSegments.add(it.uri.substringAfterLast("%2F").substringAfterLast("/")) }
-            }
-        }
-
+        val startProgress = downloadProgress.progress.coerceIn(0, segments.size)
+        downloadProgress.progress = startProgress
         downloadProgress.lastSaved = System.currentTimeMillis()
 
         coroutineScope {
@@ -741,90 +814,97 @@ class VideoDownloadService : LifecycleService() {
                 }
             }
 
-            val requestSemaphore = Semaphore(prefs().getInt(C.DOWNLOAD_CONCURRENT_LIMIT, 10))
+            val concurrentLimit = prefs().getInt(C.DOWNLOAD_CONCURRENT_LIMIT, 10).coerceIn(1, 16)
+            val nextDownloadIndex = AtomicInteger(startProgress)
             val progressMutex = Mutex()
-            val downloadJobs = (downloadProgress.progress until segments.size).map { index ->
-                val segment = segments[index]
+            var lastNotificationTime = 0L
+
+            val downloadWorkers = List(concurrentLimit) {
                 launch(Dispatchers.IO) {
-                    requestSemaphore.acquire()
-                    try {
+                    while (isActive) {
+                        val index = nextDownloadIndex.getAndUpdate { curr ->
+                            if (curr < segments.size) curr + 1 else curr
+                        }
+                        if (index >= segments.size) {
+                            break
+                        }
+                        val segment = segments[index]
                         val fileUri = SafUtils.getOrCreateChildDocument(contentResolver, path, videoDirDocId, segment.uri, "video/mp2t")
-                        val exists = SafUtils.fileExists(contentResolver, fileUri)
-                        if (!exists || !downloadedSegments.contains(segment.uri)) {
+                        val existingFileSize = SafUtils.getFileSize(contentResolver, fileUri)
+                        var segmentBytes: ByteArray? = null
+
+                        if (existingFileSize <= 0L) {
                             val segmentUrl = if (segment.uri.startsWith("http://") || segment.uri.startsWith("https://")) {
                                 segment.uri
                             } else {
                                 urlPath + segment.uri
                             }
-                            var segmentBytes: ByteArray? = null
-                            var segmentRetries = 3
-                            while (segmentBytes == null && segmentRetries > 0) {
-                                try {
-                                    segmentBytes = downloadByteArray(networkLibrary, segmentUrl)
-                                } catch (e: CancellationException) {
-                                    throw e
-                                } catch (e: Exception) {
-                                    segmentRetries--
-                                    if (segmentRetries > 0) {
-                                        delay(1000L)
-                                    } else {
-                                        if (segmentUrl.contains("-muted")) {
-                                            try {
-                                                segmentBytes = downloadByteArray(networkLibrary, segmentUrl.replace("-muted", "-unmuted"))
-                                            } catch (e2: Exception) {
-                                                try {
-                                                    segmentBytes = downloadByteArray(networkLibrary, segmentUrl.replace("-muted", ""))
-                                                } catch (e3: Exception) {
-                                                    throw e
-                                                }
-                                            }
-                                        } else if (segmentUrl.contains("-unmuted")) {
-                                            try {
-                                                segmentBytes = downloadByteArray(networkLibrary, segmentUrl.replace("-unmuted", "-muted"))
-                                            } catch (e2: Exception) {
-                                                try {
-                                                    segmentBytes = downloadByteArray(networkLibrary, segmentUrl.replace("-unmuted", ""))
-                                                } catch (e3: Exception) {
-                                                    throw e
-                                                }
-                                            }
-                                        } else {
-                                            throw e
-                                        }
-                                    }
-                                }
+                            val bytes = downloadSegmentBytes(networkLibrary, segmentUrl)
+                            SafUtils.openOutputStream(contentResolver, fileUri, append = false).use {
+                                it.write(bytes)
                             }
-                            if (segmentBytes != null) {
-                                SafUtils.openOutputStream(contentResolver, fileUri, append = false).use {
-                                    it.write(segmentBytes)
-                                }
-                            }
+                            segmentBytes = bytes
                         }
+
                         progressMutex.withLock {
                             downloadProgress.progress += 1
-                            listener?.update(downloadProgress)
-                            sendNotification(offlineVideo, downloadProgress)
+                            if (segmentBytes != null) {
+                                downloadProgress.bytes += segmentBytes.size
+                            } else if (existingFileSize > 0L) {
+                                if (downloadProgress.progress > startProgress && downloadProgress.bytes == 0L) {
+                                    downloadProgress.bytes += existingFileSize
+                                }
+                            }
+
                             val currentTime = System.currentTimeMillis()
+                            if (currentTime - lastNotificationTime >= 1000L || downloadProgress.progress == segments.size) {
+                                lastNotificationTime = currentTime
+                                listener?.update(downloadProgress)
+                                sendNotification(offlineVideo, downloadProgress)
+                            }
+
                             if (currentTime - downloadProgress.lastSaved >= 5000L) {
                                 downloadProgress.lastSaved = currentTime
-                                xtraModule.offlineVideosRepository.update(offlineVideo.apply {
-                                    progress = downloadProgress.progress
-                                    maxProgress = downloadProgress.maxProgress
-                                    bytes = downloadProgress.bytes
-                                    chatProgress = downloadProgress.chatProgress
-                                    maxChatProgress = downloadProgress.maxChatProgress
-                                    chatBytes = downloadProgress.chatBytes
-                                    chatOffsetSeconds = downloadProgress.chatOffsetSeconds
-                                })
+                                try {
+                                    xtraModule.offlineVideosRepository.update(offlineVideo.apply {
+                                        progress = downloadProgress.progress
+                                        maxProgress = downloadProgress.maxProgress
+                                        bytes = downloadProgress.bytes
+                                        chatProgress = downloadProgress.chatProgress
+                                        maxChatProgress = downloadProgress.maxChatProgress
+                                        chatBytes = downloadProgress.chatBytes
+                                        chatOffsetSeconds = downloadProgress.chatOffsetSeconds
+                                    })
+                                } catch (e: Exception) {
+                                    Log.w("VideoDownloadService", "Error updating offline video progress", e)
+                                }
                             }
                         }
-                    } finally {
-                        requestSemaphore.release()
                     }
                 }
             }
-            downloadJobs.joinAll()
-            chatJob?.join()
+
+            try {
+                downloadWorkers.joinAll()
+                chatJob?.join()
+            } finally {
+                withContext(NonCancellable) {
+                    downloadProgress.lastSaved = System.currentTimeMillis()
+                    try {
+                        xtraModule.offlineVideosRepository.update(offlineVideo.apply {
+                            progress = downloadProgress.progress
+                            maxProgress = downloadProgress.maxProgress
+                            bytes = downloadProgress.bytes
+                            chatProgress = downloadProgress.chatProgress
+                            maxChatProgress = downloadProgress.maxChatProgress
+                            chatBytes = downloadProgress.chatBytes
+                            chatOffsetSeconds = downloadProgress.chatOffsetSeconds
+                        })
+                    } catch (e: Exception) {
+                        Log.w("VideoDownloadService", "Error saving progress in finally", e)
+                    }
+                }
+            }
         }
     }
 
@@ -1685,6 +1765,7 @@ class VideoDownloadService : LifecycleService() {
 
     companion object {
         private const val CRONET_TIMEOUT = 300_000L
+        private const val SEGMENT_TIMEOUT_MS = 60_000L
         private const val GROUP_KEY = "com.github.andreyasadchy.xtra.DOWNLOADS"
 
         private const val REQUEST_CODE_PAUSE = 0

@@ -155,6 +155,7 @@ object SafUtils {
     }
 
     fun truncateFile(contentResolver: ContentResolver, fileUriString: String, targetLength: Long) {
+        if (targetLength < 0L) return
         try {
             if (isContentUri(fileUriString)) {
                 contentResolver.openFileDescriptor(fileUriString.toUri(), "rw")?.use { pfd ->
@@ -170,6 +171,21 @@ object SafUtils {
             }
         } catch (e: Exception) {
             Log.w(TAG, "Error truncating file $fileUriString to $targetLength", e)
+        }
+    }
+
+    fun getFileSize(contentResolver: ContentResolver, fileUriString: String): Long {
+        return try {
+            if (isContentUri(fileUriString)) {
+                contentResolver.openFileDescriptor(fileUriString.toUri(), "r")?.use { pfd ->
+                    pfd.statSize
+                } ?: -1L
+            } else {
+                val file = File(fileUriString)
+                if (file.exists()) file.length() else -1L
+            }
+        } catch (e: Exception) {
+            -1L
         }
     }
 
