@@ -88,6 +88,7 @@ class VideoDownloadService : LifecycleService() {
     private lateinit var downloadSemaphore: Semaphore
     private val downloadJobs = mutableMapOf<Int, Job>()
     private val offlineVideos = mutableListOf<OfflineVideo>()
+    private val stoppedVideoIds = java.util.Collections.synchronizedSet(mutableSetOf<Int>())
     val activeDownloads = mutableListOf<DownloadProgress>()
     var listener: Listener? = null
 
@@ -190,12 +191,15 @@ class VideoDownloadService : LifecycleService() {
                                 }
                             }
                         }
+                        val wasStoppedByUser = stoppedVideoIds.remove(videoId)
                         offlineVideos.remove(offlineVideo)
                         activeDownloads.remove(downloadProgress)
                         val done = (offlineVideo.quality == "chat_only" || downloadProgress.progress >= downloadProgress.maxProgress) &&
                                 (!offlineVideo.downloadChat || downloadProgress.chatProgress >= downloadProgress.maxChatProgress)
                         xtraModule.offlineVideosRepository.update(offlineVideo.apply {
-                            status = if (done) {
+                            status = if (wasStoppedByUser) {
+                                OfflineVideo.STATUS_PENDING
+                            } else if (done) {
                                 OfflineVideo.STATUS_DOWNLOADED
                             } else {
                                 val waitForWifi = if (prefs().getBoolean(C.DOWNLOAD_WIFI_ONLY, false)) {
@@ -206,10 +210,10 @@ class VideoDownloadService : LifecycleService() {
                                 if (waitForWifi) {
                                     OfflineVideo.STATUS_WAITING_FOR_WIFI
                                 } else {
-                                    OfflineVideo.STATUS_PENDING
+                                    OfflineVideo.STATUS_WAITING_FOR_NETWORK
                                 }
                             }
-                            if (status != OfflineVideo.STATUS_DOWNLOADED && prefs().getBoolean(C.DOWNLOAD_AUTO_RETRY, true)) {
+                            if (!wasStoppedByUser && status != OfflineVideo.STATUS_DOWNLOADED && prefs().getBoolean(C.DOWNLOAD_AUTO_RETRY, true)) {
                                 DownloadRetryWorker.enqueueRetry(applicationContext, 15L)
                             }
                             progress = downloadProgress.progress
@@ -1609,6 +1613,7 @@ class VideoDownloadService : LifecycleService() {
         when (intent?.action) {
             INTENT_PAUSE, INTENT_STOP, INTENT_CANCEL -> {
                 val videoId = intent.getIntExtra(KEY_VIDEO_ID, 0)
+                stoppedVideoIds.add(videoId)
                 downloadJobs[videoId]?.cancel()
                 val offlineVideo = offlineVideos.find { it.id == videoId }
                 val downloadProgress = activeDownloads.find { it.id == videoId }
@@ -1632,6 +1637,14 @@ class VideoDownloadService : LifecycleService() {
                             })
                         }
                     }
+                } else if (intent.action != INTENT_CANCEL) {
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        val dbVideo = xtraModule.offlineVideosRepository.getById(videoId)
+                        if (dbVideo != null && (dbVideo.status == OfflineVideo.STATUS_DOWNLOADING || dbVideo.status == OfflineVideo.STATUS_QUEUED)) {
+                            dbVideo.status = OfflineVideo.STATUS_PENDING
+                            xtraModule.offlineVideosRepository.update(dbVideo)
+                        }
+                    }
                 }
                 if (intent.action != INTENT_PAUSE) {
                     val nextOfflineVideo = offlineVideos.firstOrNull()
@@ -1645,7 +1658,11 @@ class VideoDownloadService : LifecycleService() {
                     }
                 }
             }
-            INTENT_START, INTENT_RESUME -> start(intent.getIntExtra(KEY_VIDEO_ID, 0))
+            INTENT_START, INTENT_RESUME -> {
+                val videoId = intent.getIntExtra(KEY_VIDEO_ID, 0)
+                stoppedVideoIds.remove(videoId)
+                start(videoId)
+            }
         }
         return START_STICKY
     }

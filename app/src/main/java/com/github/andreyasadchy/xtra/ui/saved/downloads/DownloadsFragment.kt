@@ -102,7 +102,7 @@ class DownloadsFragment : PagedListFragment(), Scrollable {
             fragment = this,
             stopDownload = { video ->
                 if (video.status == OfflineVideo.STATUS_WAITING_FOR_NETWORK || video.status == OfflineVideo.STATUS_WAITING_FOR_WIFI) {
-                    viewModel.updateDownloadStatus(video, false)
+                    viewModel.updateDownloadStatus(video, OfflineVideo.STATUS_PENDING)
                 } else {
                     if (video.live) {
                         if (video.status == OfflineVideo.STATUS_PENDING
@@ -121,23 +121,33 @@ class DownloadsFragment : PagedListFragment(), Scrollable {
                             bindStreamDownloadService(true)
                         }
                     } else {
-                        val intent = Intent(requireContext(), VideoDownloadService::class.java).apply {
-                            action = VideoDownloadService.INTENT_STOP
-                            putExtra(VideoDownloadService.KEY_VIDEO_ID, video.id)
+                        if (video.status == OfflineVideo.STATUS_PENDING
+                            || ((video.status == OfflineVideo.STATUS_DOWNLOADING
+                                    || video.status == OfflineVideo.STATUS_QUEUED)
+                                    && videoDownloadService?.activeDownloads?.toList()?.find { it.id == video.id } == null)
+                        ) {
+                            viewModel.updateDownloadStatus(video, OfflineVideo.STATUS_PENDING)
+                        } else {
+                            val intent = Intent(requireContext(), VideoDownloadService::class.java).apply {
+                                action = VideoDownloadService.INTENT_STOP
+                                putExtra(VideoDownloadService.KEY_VIDEO_ID, video.id)
+                            }
+                            requireContext().startService(intent)
+                            bindVideoDownloadService(true)
                         }
-                        requireContext().startService(intent)
-                        bindVideoDownloadService(true)
                     }
                 }
             },
             resumeDownload = {
-                val waitForWifi = if (requireContext().prefs().getBoolean(C.DOWNLOAD_WIFI_ONLY, false)) {
-                    val connectivityManager = requireContext().getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-                    val networkCapabilities = connectivityManager.getNetworkCapabilities(connectivityManager.activeNetwork)
-                    networkCapabilities != null && networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
-                } else false
+                val connectivityManager = requireContext().getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+                val networkCapabilities = connectivityManager.getNetworkCapabilities(connectivityManager.activeNetwork)
+                val hasInternet = networkCapabilities != null && networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                val isCellular = networkCapabilities != null && networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
+                val waitForWifi = requireContext().prefs().getBoolean(C.DOWNLOAD_WIFI_ONLY, false) && isCellular
                 if (waitForWifi) {
-                    viewModel.updateDownloadStatus(it, true)
+                    viewModel.updateDownloadStatus(it, OfflineVideo.STATUS_WAITING_FOR_WIFI)
+                } else if (!hasInternet) {
+                    viewModel.updateDownloadStatus(it, OfflineVideo.STATUS_WAITING_FOR_NETWORK)
                 } else {
                     if (it.live) {
                         val intent = Intent(requireContext(), StreamDownloadService::class.java).apply {
@@ -320,8 +330,9 @@ class DownloadsFragment : PagedListFragment(), Scrollable {
                 val isWifiOnly = requireContext().prefs().getBoolean(C.DOWNLOAD_WIFI_ONLY, false)
                 val connectivityManager = requireContext().getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
                 val networkCapabilities = connectivityManager.getNetworkCapabilities(connectivityManager.activeNetwork)
+                val hasInternet = networkCapabilities != null && networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
                 val isCellular = networkCapabilities != null && networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
-                val canDownload = !isWifiOnly || !isCellular
+                val canDownload = hasInternet && (!isWifiOnly || !isCellular)
 
                 for (video in activeDownloads) {
                     if (video.live) {
@@ -334,7 +345,14 @@ class DownloadsFragment : PagedListFragment(), Scrollable {
                                 }
                                 requireContext().startService(intent)
                             } else {
-                                viewModel.updateDownloadStatus(video, isWifiOnly && isCellular)
+                                val targetStatus = if (isWifiOnly && isCellular) {
+                                    OfflineVideo.STATUS_WAITING_FOR_WIFI
+                                } else if (!hasInternet) {
+                                    OfflineVideo.STATUS_WAITING_FOR_NETWORK
+                                } else {
+                                    OfflineVideo.STATUS_PENDING
+                                }
+                                viewModel.updateDownloadStatus(video, targetStatus)
                             }
                         }
                     } else {
@@ -347,12 +365,19 @@ class DownloadsFragment : PagedListFragment(), Scrollable {
                                 }
                                 requireContext().startService(intent)
                             } else {
-                                viewModel.updateDownloadStatus(video, isWifiOnly && isCellular)
+                                val targetStatus = if (isWifiOnly && isCellular) {
+                                    OfflineVideo.STATUS_WAITING_FOR_WIFI
+                                } else if (!hasInternet) {
+                                    OfflineVideo.STATUS_WAITING_FOR_NETWORK
+                                } else {
+                                    OfflineVideo.STATUS_PENDING
+                                }
+                                viewModel.updateDownloadStatus(video, targetStatus)
                             }
                         }
                     }
                 }
-                if (autoRetry) {
+                if (autoRetry && canDownload) {
                     DownloadRetryWorker.enqueueRetry(requireContext(), 1L)
                 }
                 if (activeDownloads.any { it.live }) {

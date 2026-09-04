@@ -244,7 +244,8 @@ class MainActivity : AppCompatActivity() {
                                 }
                                 val wifiOnly = prefs.getBoolean(C.DOWNLOAD_WIFI_ONLY, false)
                                 val cellular = networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
-                                if (!wifiOnly || !cellular) {
+                                val autoRetry = prefs.getBoolean(C.DOWNLOAD_AUTO_RETRY, true)
+                                if ((!wifiOnly || !cellular) && autoRetry) {
                                     val downloads = viewModel.getWaitingDownloads()
                                     if (downloads.isNotEmpty()) {
                                         downloads.forEach {
@@ -288,7 +289,7 @@ class MainActivity : AppCompatActivity() {
                         val networkCapabilities = connectivityManager.getNetworkCapabilities(connectivityManager.activeNetwork)
                         val cellular = networkCapabilities != null && networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
                         if (!cellular) {
-                            if (prefs.getBoolean(C.DOWNLOAD_WIFI_ONLY, false)) {
+                            if (prefs.getBoolean(C.DOWNLOAD_WIFI_ONLY, false) && prefs.getBoolean(C.DOWNLOAD_AUTO_RETRY, true)) {
                                 val downloads = viewModel.getWaitingDownloads()
                                 if (downloads.isNotEmpty()) {
                                     downloads.forEach {

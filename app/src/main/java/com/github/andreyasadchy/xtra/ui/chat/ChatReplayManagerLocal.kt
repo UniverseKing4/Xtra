@@ -60,8 +60,12 @@ class ChatReplayManagerLocal(
         val currentPosition = getCurrentPosition() ?: 0
         lastCheckedPosition = currentPosition
         playbackSpeed = getCurrentSpeed()
-        liveList.clear()
-        list.clear()
+        synchronized(liveList) {
+            liveList.clear()
+        }
+        synchronized(list) {
+            list.clear()
+        }
         coroutineScope.launch {
             listener.clearMessages()
         }
@@ -81,89 +85,122 @@ class ChatReplayManagerLocal(
                 messageJob?.cancel()
                 if (!liveMessages.isNullOrEmpty()) {
                     liveMessages?.let { messages ->
-                        liveList.addAll(
-                            messages.filter { message ->
-                                val messageOffset = if (createdAt != null && message.timestamp != null) {
-                                    message.timestamp - createdAt
-                                } else {
-                                    null
-                                }
-                                messageOffset != null && messageOffset >= (max(position - 20000, 0))
+                        val filtered = messages.filter { message ->
+                            val messageOffset = if (createdAt != null && message.timestamp != null) {
+                                message.timestamp - createdAt
+                            } else {
+                                null
                             }
-                        )
+                            messageOffset != null && messageOffset >= (max(position - 20000, 0))
+                        }
+                        synchronized(liveList) {
+                            liveList.addAll(filtered)
+                        }
                     }
                 } else {
                     messages?.let { messages ->
-                        list.addAll(
-                            messages.filter { message ->
-                                val messageOffset = if (createdAt != null && !message.createdAt.isNullOrBlank()) {
-                                    Instant.parseOrNull(message.createdAt)?.toEpochMilliseconds()?.takeIf { ms -> ms > 0 }?.minus(createdAt)
-                                } else {
-                                    null
-                                } ?: message.offsetSeconds?.times(1000L)
-                                messageOffset != null && messageOffset >= (max(position - 20000, 0))
-                            }
-                        )
+                        val filtered = messages.filter { message ->
+                            val messageOffset = if (createdAt != null && !message.createdAt.isNullOrBlank()) {
+                                Instant.parseOrNull(message.createdAt)?.toEpochMilliseconds()?.takeIf { ms -> ms > 0 }?.minus(createdAt)
+                            } else {
+                                null
+                            } ?: message.offsetSeconds?.times(1000L)
+                            messageOffset != null && messageOffset >= (max(position - 20000, 0))
+                        }
+                        synchronized(list) {
+                            list.addAll(filtered)
+                        }
                     }
                 }
                 isLoading = false
                 startJob()
             } catch (e: Exception) {
-
+                isLoading = false
             }
         }
     }
 
     private fun startJob() {
+        if (messageJob?.isActive == true) {
+            return
+        }
         messageJob = coroutineScope.launch {
-            while (isActive) {
+            var burstCount = 0
+            while (this@ChatReplayManagerLocal.isActive && isActive) {
                 if (!liveMessages.isNullOrEmpty()) {
-                    val message = liveList.firstOrNull() ?: break
+                    val message = synchronized(liveList) { liveList.firstOrNull() } ?: break
                     val messageOffset = if (createdAt != null && message.timestamp != null) {
                         message.timestamp - createdAt
                     } else {
                         null
                     }
                     if (messageOffset != null) {
-                        var currentPosition: Long
-                        while (
-                            (getCurrentPosition() ?: 0).let { position ->
-                                lastCheckedPosition = position
-                                currentPosition = position + startTime
-                                currentPosition < messageOffset
-                            }
-                        ) {
-                            delay(max((messageOffset - currentPosition).div(playbackSpeed ?: 1f).toLong(), 0).milliseconds)
+                        var currentPosition: Long = (getCurrentPosition() ?: 0) + startTime
+                        lastCheckedPosition = currentPosition - startTime
+
+                        if (messageOffset < currentPosition - 30_000L) {
+                            synchronized(liveList) { liveList.remove(message) }
+                            continue
                         }
-                        if (!isActive) {
+
+                        while (currentPosition < messageOffset) {
+                            burstCount = 0
+                            val speed = playbackSpeed?.takeIf { it > 0f } ?: 1f
+                            val timeLeft = (messageOffset - currentPosition).div(speed).toLong()
+                            val waitTime = timeLeft.coerceIn(30L, 1000L)
+                            delay(waitTime.milliseconds)
+                            if (!this@ChatReplayManagerLocal.isActive || !isActive) {
+                                break
+                            }
+                            val pos = getCurrentPosition() ?: 0
+                            lastCheckedPosition = pos
+                            currentPosition = pos + startTime
+                        }
+                        if (!this@ChatReplayManagerLocal.isActive || !isActive) {
                             break
                         }
                         listener.onChatMessage(message)
+                        burstCount++
+                        if (burstCount >= 3) {
+                            burstCount = 0
+                            delay(16.milliseconds)
+                        }
                     } else {
-                        if (!isActive) {
+                        if (!this@ChatReplayManagerLocal.isActive || !isActive) {
                             break
                         }
                     }
-                    liveList.remove(message)
+                    synchronized(liveList) { liveList.remove(message) }
                 } else {
-                    val message = list.firstOrNull() ?: break
+                    val message = synchronized(list) { list.firstOrNull() } ?: break
                     val messageOffset = if (createdAt != null && !message.createdAt.isNullOrBlank()) {
                         Instant.parseOrNull(message.createdAt)?.toEpochMilliseconds()?.takeIf { ms -> ms > 0 }?.minus(createdAt)
                     } else {
                         null
                     } ?: message.offsetSeconds?.times(1000L)
                     if (messageOffset != null) {
-                        var currentPosition: Long
-                        while (
-                            (getCurrentPosition() ?: 0).let { position ->
-                                lastCheckedPosition = position
-                                currentPosition = position + startTime
-                                currentPosition < messageOffset
-                            }
-                        ) {
-                            delay(max((messageOffset - currentPosition).div(playbackSpeed ?: 1f).toLong(), 0).milliseconds)
+                        var currentPosition: Long = (getCurrentPosition() ?: 0) + startTime
+                        lastCheckedPosition = currentPosition - startTime
+
+                        if (messageOffset < currentPosition - 30_000L) {
+                            synchronized(list) { list.remove(message) }
+                            continue
                         }
-                        if (!isActive) {
+
+                        while (currentPosition < messageOffset) {
+                            burstCount = 0
+                            val speed = playbackSpeed?.takeIf { it > 0f } ?: 1f
+                            val timeLeft = (messageOffset - currentPosition).div(speed).toLong()
+                            val waitTime = timeLeft.coerceIn(30L, 1000L)
+                            delay(waitTime.milliseconds)
+                            if (!this@ChatReplayManagerLocal.isActive || !isActive) {
+                                break
+                            }
+                            val pos = getCurrentPosition() ?: 0
+                            lastCheckedPosition = pos
+                            currentPosition = pos + startTime
+                        }
+                        if (!this@ChatReplayManagerLocal.isActive || !isActive) {
                             break
                         }
                         listener.onChatMessage(
@@ -181,12 +218,17 @@ class ChatReplayManagerLocal(
                                 fullMsg = message.fullMsg
                             )
                         )
+                        burstCount++
+                        if (burstCount >= 3) {
+                            burstCount = 0
+                            delay(16.milliseconds)
+                        }
                     } else {
-                        if (!isActive) {
+                        if (!this@ChatReplayManagerLocal.isActive || !isActive) {
                             break
                         }
                     }
-                    list.remove(message)
+                    synchronized(list) { list.remove(message) }
                 }
             }
         }
@@ -197,8 +239,12 @@ class ChatReplayManagerLocal(
             if (position - lastCheckedPosition !in 0..20000) {
                 loadJob?.cancel()
                 messageJob?.cancel()
-                liveList.clear()
-                list.clear()
+                synchronized(liveList) {
+                    liveList.clear()
+                }
+                synchronized(list) {
+                    list.clear()
+                }
                 coroutineScope.launch {
                     listener.clearMessages()
                 }

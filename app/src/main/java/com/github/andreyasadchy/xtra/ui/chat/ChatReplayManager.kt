@@ -47,7 +47,9 @@ class ChatReplayManager(
             val currentPosition = getCurrentPosition() ?: 0
             lastCheckedPosition = currentPosition
             playbackSpeed = getCurrentSpeed()
-            list.clear()
+            synchronized(list) {
+                list.clear()
+            }
             coroutineScope.launch {
                 listener.clearMessages()
             }
@@ -120,7 +122,9 @@ class ChatReplayManager(
                     }
                 }
                 messageJob?.cancel()
-                list.addAll(messages)
+                synchronized(list) {
+                    list.addAll(messages)
+                }
                 cursor = if (comments.pageInfo?.hasNextPage != false) comments.edges.lastOrNull()?.cursor?.toString() else null
                 isLoading = false
                 startJob()
@@ -181,40 +185,55 @@ class ChatReplayManager(
                         }
                     }
                     messageJob?.cancel()
-                    list.addAll(messages)
+                    synchronized(list) {
+                        list.addAll(messages)
+                    }
                     cursor = if (comments.pageInfo?.hasNextPage != false) comments.edges.lastOrNull()?.cursor else null
                     isLoading = false
                     startJob()
                 } catch (e: Exception) {
-
+                    isLoading = false
                 }
             }
         }
     }
 
     private fun startJob() {
+        if (messageJob?.isActive == true) {
+            return
+        }
         messageJob = coroutineScope.launch {
-            while (isActive) {
-                val message = list.firstOrNull() ?: break
+            var burstCount = 0
+            while (this@ChatReplayManager.isActive && isActive) {
+                val message = synchronized(list) { list.firstOrNull() } ?: break
                 val messageOffset = if (createdAt != null && !message.createdAt.isNullOrBlank()) {
                     Instant.parseOrNull(message.createdAt)?.toEpochMilliseconds()?.takeIf { ms -> ms > 0 }?.minus(createdAt)
                 } else {
                     null
                 } ?: message.offsetSeconds?.times(1000L)
                 if (messageOffset != null) {
-                    var currentPosition: Long
-                    while (
-                        (getCurrentPosition() ?: 0).let { position ->
-                            lastCheckedPosition = position
-                            currentPosition = position + startTime
-                            currentPosition < messageOffset
-                        }
-                    ) {
-                        val timeLeft = (messageOffset - currentPosition).div(playbackSpeed ?: 1f).toLong()
-                        val delay = max(timeLeft, 1) // ExoPlayer getCurrentPosition freezes the app if it's called too rapidly
-                        delay(delay.milliseconds)
+                    var currentPosition: Long = (getCurrentPosition() ?: 0) + startTime
+                    lastCheckedPosition = currentPosition - startTime
+
+                    if (messageOffset < currentPosition - 30_000L) {
+                        synchronized(list) { list.remove(message) }
+                        continue
                     }
-                    if (!isActive) {
+
+                    while (currentPosition < messageOffset) {
+                        burstCount = 0
+                        val speed = playbackSpeed?.takeIf { it > 0f } ?: 1f
+                        val timeLeft = (messageOffset - currentPosition).div(speed).toLong()
+                        val waitTime = timeLeft.coerceIn(30L, 1000L)
+                        delay(waitTime.milliseconds)
+                        if (!this@ChatReplayManager.isActive || !isActive) {
+                            break
+                        }
+                        val pos = getCurrentPosition() ?: 0
+                        lastCheckedPosition = pos
+                        currentPosition = pos + startTime
+                    }
+                    if (!this@ChatReplayManager.isActive || !isActive) {
                         break
                     }
                     listener.onChatMessage(
@@ -232,15 +251,21 @@ class ChatReplayManager(
                             fullMsg = message.fullMsg
                         )
                     )
-                    if (list.size <= 25 && !cursor.isNullOrBlank() && !isLoading) {
+                    burstCount++
+                    if (burstCount >= 3) {
+                        burstCount = 0
+                        delay(16.milliseconds)
+                    }
+                    val shouldLoad = synchronized(list) { list.size <= 25 }
+                    if (shouldLoad && !cursor.isNullOrBlank() && !isLoading) {
                         load()
                     }
                 } else {
-                    if (!isActive) {
+                    if (!this@ChatReplayManager.isActive || !isActive) {
                         break
                     }
                 }
-                list.remove(message)
+                synchronized(list) { list.remove(message) }
             }
         }
     }
@@ -250,7 +275,9 @@ class ChatReplayManager(
             if (position - lastCheckedPosition !in 0..20000) {
                 loadJob?.cancel()
                 messageJob?.cancel()
-                list.clear()
+                synchronized(list) {
+                    list.clear()
+                }
                 coroutineScope.launch {
                     listener.clearMessages()
                 }

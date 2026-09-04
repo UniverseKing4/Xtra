@@ -20,10 +20,10 @@ interface OfflineVideosDao {
     @Query("SELECT * FROM videos WHERE url = :url")
     fun getByUrl(url: String): OfflineVideo?
 
-    @Query("SELECT * FROM videos WHERE status = ${OfflineVideo.STATUS_DOWNLOADING} OR status = ${OfflineVideo.STATUS_WAITING_FOR_STREAM}")
+    @Query("SELECT * FROM videos WHERE status = ${OfflineVideo.STATUS_DOWNLOADING} OR status = ${OfflineVideo.STATUS_QUEUED} OR status = ${OfflineVideo.STATUS_WAITING_FOR_STREAM}")
     fun getActiveDownloads(): List<OfflineVideo>
 
-    @Query("SELECT * FROM videos WHERE status = ${OfflineVideo.STATUS_WAITING_FOR_WIFI} OR status = ${OfflineVideo.STATUS_WAITING_FOR_NETWORK} OR status = ${OfflineVideo.STATUS_PENDING}")
+    @Query("SELECT * FROM videos WHERE status = ${OfflineVideo.STATUS_WAITING_FOR_WIFI} OR status = ${OfflineVideo.STATUS_WAITING_FOR_NETWORK}")
     fun getWaitingDownloads(): List<OfflineVideo>
 
     @Query("SELECT * FROM videos WHERE videoId = :id")

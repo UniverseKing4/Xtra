@@ -56,6 +56,14 @@ class DownloadsViewModel(
         }
     }
 
+    fun updateDownloadStatus(video: OfflineVideo, status: Int) {
+        viewModelScope.launch(Dispatchers.IO) {
+            offlineVideosRepository.update(video.apply {
+                this.status = status
+            })
+        }
+    }
+
     fun finishDownload(video: OfflineVideo) {
         video.chatUrl?.let { url ->
             val isShared = url.toUri().scheme == ContentResolver.SCHEME_CONTENT

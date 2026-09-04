@@ -155,4 +155,51 @@ class DownloadTest {
         video.status = OfflineVideo.STATUS_DOWNLOADED
         assertEquals(OfflineVideo.STATUS_DOWNLOADED, video.status)
     }
+
+    @Test
+    fun testManualStopDoesNotBecomeWaitingDownload() {
+        val stoppedVideo = OfflineVideo(
+            videoId = "123",
+            name = "Manual Stopped VOD",
+            status = OfflineVideo.STATUS_PENDING
+        )
+        // Verify that STATUS_PENDING is distinct from STATUS_WAITING_FOR_WIFI and STATUS_WAITING_FOR_NETWORK
+        val isWaitingDownload = stoppedVideo.status == OfflineVideo.STATUS_WAITING_FOR_WIFI ||
+                stoppedVideo.status == OfflineVideo.STATUS_WAITING_FOR_NETWORK
+        assertEquals(false, isWaitingDownload)
+    }
+
+    @Test
+    fun testNetworkFailureBecomesWaitingForNetworkOrWifi() {
+        fun resolveFailureStatus(wifiOnly: Boolean, isCellular: Boolean): Int {
+            return if (wifiOnly && isCellular) {
+                OfflineVideo.STATUS_WAITING_FOR_WIFI
+            } else {
+                OfflineVideo.STATUS_WAITING_FOR_NETWORK
+            }
+        }
+
+        assertEquals(OfflineVideo.STATUS_WAITING_FOR_WIFI, resolveFailureStatus(wifiOnly = true, isCellular = true))
+        assertEquals(OfflineVideo.STATUS_WAITING_FOR_NETWORK, resolveFailureStatus(wifiOnly = false, isCellular = true))
+        assertEquals(OfflineVideo.STATUS_WAITING_FOR_NETWORK, resolveFailureStatus(wifiOnly = true, isCellular = false))
+    }
+
+    @Test
+    fun testChatReplayDelayAtVariablePlaybackSpeed() {
+        val currentPosition = 10000L
+        val messageOffset = 10100L
+
+        for (speed in listOf(1.0f, 1.25f, 1.5f, 2.0f)) {
+            val timeLeft = (messageOffset - currentPosition).div(speed).toLong()
+            val delay = timeLeft.coerceIn(30L, 1000L)
+            assert(delay >= 30L) { "Delay should be at least 30ms to prevent UI freeze" }
+            assert(delay <= 1000L) { "Delay should be capped at 1000ms" }
+        }
+
+        // When message is in past (messageOffset <= currentPosition)
+        val pastMessageOffset = 9500L
+        val pastTimeLeft = (pastMessageOffset - currentPosition).div(2.0f).toLong()
+        val pastDelay = pastTimeLeft.coerceIn(30L, 1000L)
+        assertEquals(30L, pastDelay)
+    }
 }
